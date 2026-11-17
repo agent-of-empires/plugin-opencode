@@ -1,0 +1,344 @@
+import { expect, test } from "bun:test";
+import { chmodSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
+import {
+  REPLY_NAME,
+  SNAPSHOT_NAME,
+  SUPPORTED_RANGES,
+  approvalPrompt,
+  classify,
+  createBridge,
+  createTracker,
+  ensurePrivateDirectories,
+  integrationDirectory,
+  isSupportedVersion,
+  providerReply,
+  questionPrompt,
+  readReply,
+  resolveInstanceId,
+  satisfies,
+  validateReply,
+  writeSnapshot,
+} from "../opencode-extension/index.ts";
+
+const INSTANCE = "instance-a";
+const VERSION = "1.18.32";
+const UID = process.getuid?.() ?? 0;
+const PID = 4242;
+
+function privateDirectory(): string {
+  const root = mkdtempSync(path.join(tmpdir(), "aoe-opencode-test-"));
+  chmodSync(root, 0o700);
+  return root;
+}
+
+function event(type: string, properties: Record<string, unknown> = {}) {
+  return { type, properties };
+}
+
+const approvalRequest = {
+  id: "per_abc",
+  sessionID: "ses_root",
+  permission: "bash",
+  patterns: ["npm test"],
+  metadata: {},
+  always: ["npm *"],
+};
+
+const questionRequest = {
+  id: "que_abc",
+  sessionID: "ses_root",
+  questions: [
+    {
+      question: "Which environment?",
+      header: "Env",
+      options: [
+        { label: "staging", description: "Pre-production" },
+        { label: "production" },
+      ],
+      multiple: false,
+    },
+  ],
+};
+
+test("the declared provider ranges cover supported OpenCode generations only", () => {
+  expect(isSupportedVersion("1.18.29")).toBe(true);
+  expect(isSupportedVersion("1.18.32")).toBe(true);
+  expect(isSupportedVersion("1.19.0")).toBe(true);
+  expect(isSupportedVersion("1.18.28")).toBe(false);
+  expect(isSupportedVersion("2.0.0-beta.19242")).toBe(true);
+  expect(isSupportedVersion("2.4.1")).toBe(true);
+  expect(isSupportedVersion("3.0.0")).toBe(false);
+  expect(isSupportedVersion("not-a-version")).toBe(false);
+  expect(isSupportedVersion(undefined)).toBe(false);
+});
+
+test("semver matching fails closed on unknown syntax and honours prereleases", () => {
+  expect(satisfies("1.2.3", [">=1.2.0, <2.0.0"])).toBe(true);
+  expect(satisfies("1.2.3", ["^1.0.0"])).toBe(true);
+  expect(satisfies("2.0.0", ["^1.0.0"])).toBe(false);
+  expect(satisfies("2.0.0-rc.1", [">=1.0.0, <3.0.0"])).toBe(false);
+  expect(satisfies("2.0.0-rc.1", [">=2.0.0-0, <3.0.0"])).toBe(true);
+  expect(satisfies("1.2.3", ["nonsense"])).toBe(false);
+  expect(satisfies(VERSION, SUPPORTED_RANGES)).toBe(true);
+});
+
+test("permission and question events publish AoE prompts", () => {
+  const tracker = createTracker();
+  const approval = classify(event("permission.asked", approvalRequest), tracker);
+  expect(approval.status).toBe("waiting");
+  expect(approval.prompt).toEqual({
+    kind: "approval",
+    id: "per_abc",
+    title: "bash: npm test",
+    allow_always: true,
+  });
+
+  const question = classify(event("question.asked", questionRequest), tracker);
+  expect(question.prompt).toEqual({
+    kind: "question",
+    id: "que_abc",
+    title: "Which environment?",
+    questions: [
+      {
+        id: "que_abc:0",
+        question: "Which environment?",
+        options: [
+          { label: "staging", description: "Pre-production" },
+          { label: "production", description: null },
+        ],
+        multi: false,
+        recommended: null,
+      },
+    ],
+  });
+});
+
+test("status events map to running, idle and error, and a reply clears the prompt", () => {
+  const tracker = createTracker();
+  expect(classify(event("session.status", { sessionID: "ses", status: { type: "busy" } }), tracker).status).toBe(
+    "running",
+  );
+  expect(classify(event("session.status", { sessionID: "ses", status: "idle" }), tracker).status).toBe("idle");
+  expect(classify(event("session.status", { sessionID: "ses", status: "teleporting" }), tracker).status).toBeUndefined();
+  expect(classify(event("session.idle", { sessionID: "ses" }), tracker).status).toBe("idle");
+  expect(classify(event("session.error", { sessionID: "ses" }), tracker).status).toBe("error");
+  expect(classify(event("permission.replied", { sessionID: "ses" }), tracker)).toMatchObject({
+    status: "running",
+    prompt: null,
+  });
+});
+
+test("a child session cannot move the root status but its prompt is answerable", () => {
+  const tracker = createTracker();
+  classify(event("session.created", { sessionID: "ses_child", info: { id: "ses_child", parentID: "ses_root" } }), tracker);
+  const status = classify(event("session.status", { sessionID: "ses_child", status: "idle" }), tracker);
+  expect(status).toMatchObject({ child: true });
+  expect(status.status).toBeUndefined();
+  const prompt = classify(event("permission.asked", { ...approvalRequest, id: "per_child", sessionID: "ses_child" }), tracker);
+  expect(prompt.status).toBe("waiting");
+  expect(prompt.prompt?.id).toBe("per_child");
+});
+
+test("malformed prompts are dropped instead of publishing an unusable dialog", () => {
+  expect(approvalPrompt({})).toBeUndefined();
+  expect(questionPrompt({ id: "que", questions: [] })).toBeUndefined();
+  expect(questionPrompt({ id: "que", questions: [{ question: "Pick", options: [] }] })).toBeUndefined();
+  expect(
+    questionPrompt({ id: "que", questions: [{ question: "Pick", options: [{ label: "a" }, { label: "a" }] }] }),
+  ).toBeUndefined();
+});
+
+function snapshot(overrides: Record<string, unknown> = {}) {
+  return {
+    schema_version: 1,
+    instance_id: INSTANCE,
+    provider_version: VERSION,
+    provider_session_id: "ses_root",
+    writer_pid: PID,
+    revision: 3,
+    status: "waiting" as const,
+    reply_keys: ["F12"],
+    prompt: {
+      kind: "approval" as const,
+      id: "per_abc",
+      title: "bash: npm test",
+      allow_always: false,
+    },
+    ...overrides,
+  };
+}
+
+function reply(overrides: Record<string, unknown> = {}) {
+  return {
+    schema_version: 1,
+    instance_id: INSTANCE,
+    provider_session_id: "ses_root",
+    writer_pid: PID,
+    revision: 3,
+    prompt_id: "per_abc",
+    response_id: "7d442dd2-7b10-4cc4-9207-123456789abc",
+    response: { kind: "approval", choice: "allow" },
+    ...overrides,
+  };
+}
+
+test("a reply is accepted only for the live prompt and revision", () => {
+  const live = snapshot();
+  expect(validateReply(reply(), live)).toBe(true);
+  expect(validateReply(reply({ revision: 2 }), live)).toBe(false);
+  expect(validateReply(reply({ prompt_id: "per_other" }), live)).toBe(false);
+  expect(validateReply(reply({ instance_id: "instance-b" }), live)).toBe(false);
+  expect(validateReply(reply({ response_id: "not-a-uuid" }), live)).toBe(false);
+  expect(validateReply(reply({ response: { kind: "approval", choice: "allow_always" } }), live)).toBe(false);
+  expect(validateReply(reply(), snapshot({ prompt: { ...live.prompt, allow_always: true } }))).toBe(true);
+});
+
+test("question replies require one selection or a custom answer per question", () => {
+  const prompt = {
+    kind: "question" as const,
+    id: "que_abc",
+    title: "Pick",
+    questions: [
+      {
+        id: "que_abc:0",
+        question: "Pick",
+        options: [{ label: "a", description: null }],
+        multi: false,
+        recommended: null,
+      },
+    ],
+  };
+  const live = snapshot({ prompt });
+  const answer = (entry: Record<string, unknown>) =>
+    reply({ prompt_id: "que_abc", response: { kind: "question", answers: [entry] } });
+  expect(validateReply(answer({ id: "que_abc:0", selected_options: ["a"] }), live)).toBe(true);
+  expect(validateReply(answer({ id: "que_abc:0", selected_options: [], custom_input: "b" }), live)).toBe(true);
+  expect(validateReply(answer({ id: "que_abc:0", selected_options: [] }), live)).toBe(false);
+  expect(validateReply(answer({ id: "que_abc:0", selected_options: ["a"], custom_input: "b" }), live)).toBe(false);
+  expect(validateReply(answer({ id: "que_abc:0", selected_options: ["z"] }), live)).toBe(false);
+});
+
+test("AoE choices become OpenCode decisions and positional answers", () => {
+  const approval = { kind: "approval" as const, id: "per", title: "bash", allow_always: true };
+  expect(providerReply(approval, reply() as any)).toEqual({ kind: "approval", choice: "once" });
+  expect(
+    providerReply(approval, reply({ response: { kind: "approval", choice: "allow_always" } }) as any),
+  ).toEqual({ kind: "approval", choice: "always" });
+  expect(providerReply(approval, reply({ response: { kind: "approval", choice: "deny" } }) as any)).toEqual({
+    kind: "approval",
+    choice: "reject",
+  });
+  const question = {
+    kind: "question" as const,
+    id: "que_abc",
+    title: "Pick",
+    questions: [
+      { id: "que_abc:0", question: "Pick", options: [{ label: "a", description: null }], multi: false, recommended: null },
+    ],
+  };
+  expect(
+    providerReply(question, {
+      response: {
+        kind: "question",
+        answers: [{ id: "que_abc:0", selected_options: ["a"], custom_input: "other" }],
+      },
+    } as any),
+  ).toEqual({ kind: "question", answers: [["a", "other"]] });
+});
+
+test("reports round-trip through a private directory and replies are read back", async () => {
+  const root = privateDirectory();
+  try {
+    expect(await ensurePrivateDirectories(root, path.join(root, INSTANCE), UID)).toBe(true);
+    const directory = path.join(root, INSTANCE);
+    await writeSnapshot(directory, snapshot());
+    expect(readdirSync(directory)).toEqual([SNAPSHOT_NAME]);
+    expect(statSync(path.join(directory, SNAPSHOT_NAME)).mode & 0o777).toBe(0o600);
+    expect(readReply(directory, UID, snapshot())).toBeUndefined();
+    writeFileSync(path.join(directory, REPLY_NAME), JSON.stringify(reply()), { mode: 0o600 });
+    expect(readReply(directory, UID, snapshot())?.response_id).toBe(reply().response_id);
+    chmodSync(path.join(directory, REPLY_NAME), 0o644);
+    expect(readReply(directory, UID, snapshot())).toBeUndefined();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the bridge publishes transitions, applies one reply, and ignores a stale duplicate", async () => {
+  const root = privateDirectory();
+  const delivered: unknown[] = [];
+  try {
+    const directory = path.join(root, INSTANCE);
+    await ensurePrivateDirectories(root, directory, UID);
+    const bridge = createBridge({
+      instanceId: INSTANCE,
+      directory,
+      providerVersion: VERSION,
+      uid: UID,
+      pid: PID,
+      respond: async (prompt, value) => {
+        delivered.push(providerReply(prompt, value));
+      },
+    });
+
+    await bridge.observe(event("session.created", { sessionID: "ses_root", info: { id: "ses_root" } }));
+    // A session with no reported status yet publishes nothing.
+    expect(bridge.snapshot()).toBeUndefined();
+    await bridge.observe(event("session.status", { sessionID: "ses_root", status: { type: "idle" } }));
+    expect(bridge.snapshot()).toMatchObject({ status: "idle", prompt: null, revision: 1, reply_keys: ["F12"] });
+
+    await bridge.observe(event("permission.asked", approvalRequest));
+    const waiting = bridge.snapshot()!;
+    expect(waiting).toMatchObject({ status: "waiting", revision: 2 });
+    expect(waiting.prompt?.id).toBe("per_abc");
+    expect(readReply(directory, UID, waiting)).toBeUndefined();
+
+    writeFileSync(path.join(directory, REPLY_NAME), JSON.stringify(reply({ revision: waiting.revision })), {
+      mode: 0o600,
+    });
+    expect(await bridge.pollReply()).toBe(true);
+    expect(delivered).toEqual([{ kind: "approval", choice: "once" }]);
+    expect(bridge.snapshot()).toMatchObject({ status: "running", prompt: null, revision: 3 });
+
+    writeFileSync(path.join(directory, REPLY_NAME), JSON.stringify(reply({ revision: 2 })), { mode: 0o600 });
+    expect(await bridge.pollReply()).toBe(false);
+    expect(delivered).toHaveLength(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an unsupported provider version publishes nothing", async () => {
+  const root = privateDirectory();
+  try {
+    const directory = path.join(root, INSTANCE);
+    await ensurePrivateDirectories(root, directory, UID);
+    const bridge = createBridge({
+      instanceId: INSTANCE,
+      directory,
+      providerVersion: "3.0.0",
+      uid: UID,
+      pid: PID,
+      respond: async () => {},
+    });
+    await bridge.observe(event("session.created", { sessionID: "ses_root" }));
+    await bridge.observe(event("permission.asked", approvalRequest));
+    await bridge.flush();
+    expect(bridge.snapshot()).toBeUndefined();
+    expect(readdirSync(directory)).toEqual([]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("instance identity comes from AoE's environment or the pane's tmux environment", () => {
+  expect(resolveInstanceId({ AOE_INSTANCE_ID: "instance-a" }, () => undefined)).toBe("instance-a");
+  expect(resolveInstanceId({ AOE_INSTANCE_ID: "../escape" }, () => undefined)).toBeUndefined();
+  expect(resolveInstanceId({ TMUX_PANE: "%4" }, () => "AOE_INSTANCE_ID=instance-b")).toBe("instance-b");
+  expect(resolveInstanceId({ TMUX_PANE: "%4" }, () => "AOE_INSTANCE_ID=bad id")).toBeUndefined();
+  expect(resolveInstanceId({}, () => undefined)).toBeUndefined();
+  expect(integrationDirectory(501, "instance-a")).toBe("/tmp/aoe-hooks-501/instance-a");
+});
