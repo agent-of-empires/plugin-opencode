@@ -23,6 +23,8 @@ export const REPLY_POLL_MS = 250;
 export const MAX_FILE_BYTES = 65_536;
 export const REPLY_KEY = "F12";
 
+let tempSequence = 0;
+
 /// Declared in `aoe-plugin.toml` as well. The host decides compatibility from
 /// the published version; this copy keeps an unsupported runtime from driving
 /// reply APIs it cannot honour.
@@ -462,7 +464,8 @@ export async function ensurePrivateDirectories(root: string, directory: string, 
 
 export async function writeSnapshot(directory: string, snapshot: Snapshot): Promise<void> {
   const target = path.join(directory, SNAPSHOT_NAME);
-  const temporary = path.join(directory, `.${SNAPSHOT_NAME}.${process.pid}.tmp`);
+  // Unique per call: a heartbeat and an event can publish at the same time.
+  const temporary = path.join(directory, `.${SNAPSHOT_NAME}.${process.pid}.${tempSequence++}.tmp`);
   const bytes = Buffer.from(`${JSON.stringify(snapshot)}\n`, "utf8");
   const handle = await open(temporary, "w", 0o600);
   try {
@@ -534,6 +537,7 @@ export function createBridge(options: BridgeOptions): Bridge {
   let revision = 1;
   let written: string | undefined;
   let lastWrite = 0;
+  let pending: Promise<void> = Promise.resolve();
   let timer: ReturnType<typeof setInterval> | undefined;
   let poller: ReturnType<typeof setInterval> | undefined;
   const applied = new Set<string>();
@@ -554,7 +558,7 @@ export function createBridge(options: BridgeOptions): Bridge {
     };
   };
 
-  const flush = async (): Promise<void> => {
+  const write = async (): Promise<void> => {
     const snapshot = current();
     if (!snapshot) return;
     const serialized = JSON.stringify(snapshot);
@@ -567,6 +571,12 @@ export function createBridge(options: BridgeOptions): Bridge {
     } catch (error) {
       log(`could not publish status: ${String(error)}`);
     }
+  };
+
+  // One writer at a time, so an event and the heartbeat cannot race the file.
+  const flush = (): Promise<void> => {
+    pending = pending.then(write, write);
+    return pending;
   };
 
   const observe = async (event: unknown): Promise<void> => {
@@ -820,12 +830,16 @@ async function v2(ctx: Record<string, any>): Promise<Wiring | undefined> {
   };
 }
 
-async function server(input: Record<string, any>): Promise<Record<string, (event: unknown) => Promise<void>>> {
+async function server(input: Record<string, any>): Promise<Record<string, (arg: unknown) => Promise<void>>> {
   const wiring = await v1(input);
   if (!wiring) return { event: async () => {} };
   return {
-    event: async (event: unknown) => {
+    // V1 calls a hook with a wrapper object, so the report sees the event it
+    // names rather than the wrapper.
+    event: async (arg: unknown) => {
       try {
+        const event = isRecord(arg) && isRecord(arg.event) ? arg.event : arg;
+        if (DEBUG()) log(`event ${isRecord(event) ? String(event.type) : "?"}`);
         await wiring.bridge.observe(event);
       } catch {
         // Reporting must never break the host session.

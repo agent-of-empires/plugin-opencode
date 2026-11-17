@@ -34,6 +34,16 @@ One entrypoint serves both generations: OpenCode 1.x calls the default export's
 `server()`, and OpenCode 2.x calls `setup()`. Both read the event shape
 `{ type, properties }`, so a single classifier serves them.
 
+### Verified builds
+
+Status was verified live against OpenCode `1.19.6` (`serve`, real
+`session.created`, `session.status` and `session.idle` events, report published
+and consumed by the host). That build loads the default export's `server()` and
+reads its `plugin` config key with a file path. Reply delivery is covered by the
+extension's tests against OpenCode's reply routes; it has not been exercised
+against a live permission prompt, and OpenCode 2.x has not been run live at all.
+Both remain unproven until someone drives them with a configured model.
+
 ### Unsupported versions and missing plugins
 
 On an unsupported version the extension logs one line naming the running
@@ -46,9 +56,9 @@ owned `Unknown`. The status-only report is what lets the host read that version
 and say why it stepped aside.
 
 While the extension or the AoE plugin is missing, disabled, or unapproved, pane
-detection remains the status source. Installing the AoE plugin without the
-OpenCode extension claims the `opencode` tool for status and therefore reports
-`Unknown` until the extension publishes a report; install both or neither.
+detection remains the status source. A missing report is not an invalid one: the
+host keeps the session's pane status until the extension publishes, so
+installing the AoE plugin before the extension does not blank status.
 
 ## Install
 

@@ -267,6 +267,52 @@ test("reports round-trip through a private directory and replies are read back",
   }
 });
 
+test("concurrent publishes settle on one file and leave no temporary behind", async () => {
+  const root = privateDirectory();
+  try {
+    const directory = path.join(root, INSTANCE);
+    await ensurePrivateDirectories(root, directory, UID);
+    const writes = Array.from({ length: 8 }, (_, index) =>
+      writeSnapshot(directory, { ...snapshot(), revision: index }),
+    );
+    await Promise.all(writes);
+    expect(readdirSync(directory)).toEqual([SNAPSHOT_NAME]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a heartbeat publish racing an event publish cannot fail the flush", async () => {
+  const root = privateDirectory();
+  try {
+    const directory = path.join(root, INSTANCE);
+    await ensurePrivateDirectories(root, directory, UID);
+    const bridge = createBridge({
+      instanceId: INSTANCE,
+      directory,
+      providerVersion: VERSION,
+      uid: UID,
+      pid: PID,
+      respond: async () => {},
+    });
+    bridge.start();
+    try {
+      await Promise.all([
+        bridge.observe(event("session.created", { sessionID: "ses_root" })),
+        bridge.observe(event("session.status", { sessionID: "ses_root", status: "busy" })),
+        bridge.flush(),
+        bridge.flush(),
+      ]);
+      expect(readdirSync(directory)).toEqual([SNAPSHOT_NAME]);
+      expect(bridge.snapshot()?.status).toBe("running");
+    } finally {
+      bridge.stop();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("the bridge publishes transitions, applies one reply, and ignores a stale duplicate", async () => {
   const root = privateDirectory();
   const delivered: unknown[] = [];
