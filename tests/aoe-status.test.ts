@@ -131,6 +131,36 @@ test("status events map to running, idle and error, and a reply clears the promp
   });
 });
 
+function v2Event(type: string, data: Record<string, unknown> = {}) {
+  return { id: "evt_1", created: 1, type, data };
+}
+
+test("V2 events publish the same statuses and prompts through their data envelope", () => {
+  const tracker = createTracker();
+  expect(classify(v2Event("session.execution.started", { sessionID: "ses_v2" }), tracker).status).toBe("running");
+  expect(classify(v2Event("session.execution.succeeded", { sessionID: "ses_v2" }), tracker).status).toBe("idle");
+  expect(classify(v2Event("session.execution.failed", { sessionID: "ses_v2" }), tracker).status).toBe("error");
+  expect(classify(v2Event("session.execution.interrupted", { sessionID: "ses_v2" }), tracker).status).toBe("idle");
+  expect(classify(v2Event("session.tool.called", { sessionID: "ses_v2" }), tracker).status).toBe("running");
+
+  const prompt = classify(
+    v2Event("permission.asked", {
+      id: "per_v2",
+      sessionID: "ses_v2",
+      action: "shell",
+      resources: ["echo hi"],
+      save: ["echo *"],
+    }),
+    tracker,
+  );
+  expect(prompt.status).toBe("waiting");
+  expect(prompt.prompt).toEqual({ kind: "approval", id: "per_v2", title: "shell: echo hi", allow_always: true });
+
+  const child = classify(v2Event("session.created", { sessionID: "ses_child", parentID: "ses_v2" }), tracker);
+  expect(child.child).toBe(true);
+  expect(classify(v2Event("session.execution.succeeded", { sessionID: "ses_child" }), tracker).status).toBeUndefined();
+});
+
 test("a child session cannot move the root status but its prompt is answerable", () => {
   const tracker = createTracker();
   classify(event("session.created", { sessionID: "ses_child", info: { id: "ses_child", parentID: "ses_root" } }), tracker);

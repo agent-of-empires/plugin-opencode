@@ -1,6 +1,6 @@
 {
   "name": "@agent-of-empires/opencode-integration",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "OpenCode-native status and prompt replies for Agent of Empires",

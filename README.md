@@ -25,24 +25,33 @@ ranges before it activates:
 | Range | Notes |
 | --- | --- |
 | `>=1.18.29, <2.0.0` | OpenCode 1.x loads the default export's `server()`, and answers permissions through the server's reply routes. |
-| `>=2.0.0-0, <3.0.0` | OpenCode 2.x loads `setup(ctx)`, subscribes to the event bus, and replies through `ctx.permission.reply`. 2.x is still in beta; the plugin API may change, and a compatible extension release will be published when it does. |
+| `>=2.0.0-0, <3.0.0` | OpenCode 2.x loads `setup(ctx)`, subscribes to the event bus, and replies through `ctx.permission.reply`. 2.x is still in beta; the plugin API may change, and a compatible extension release will be published when it does. V2 has no combined status event, so the extension maps the execution lifecycle (`session.execution.started` and its terminal events) onto AoE's statuses. |
 
 Prereleases are excluded from the 1.x range and included in the 2.x range.
 OpenCode 1.18.28 and earlier and OpenCode 3.x are not supported.
 
 One entrypoint serves both generations: OpenCode 1.x calls the default export's
-`server()`, and OpenCode 2.x calls `setup()`. Both read the event shape
-`{ type, properties }`, so a single classifier serves them.
+`server()`, and OpenCode 2.x calls `setup()`. One classifier serves them: V1
+carries event fields under `properties`, V2 under `data`, and V2 names its
+lifecycle events differently, so the classifier translates both.
 
 ### Verified builds
 
-Status was verified live against OpenCode `1.19.6` (`serve`, real
-`session.created`, `session.status` and `session.idle` events, report published
-and consumed by the host). That build loads the default export's `server()` and
-reads its `plugin` config key with a file path. Reply delivery is covered by the
-extension's tests against OpenCode's reply routes; it has not been exercised
-against a live permission prompt, and OpenCode 2.x has not been run live at all.
-Both remain unproven until someone drives them with a configured model.
+OpenCode `1.19.6` (`serve`) was verified live with a permission rule asking for
+`bash`: the extension published `waiting` with the approval prompt, an AoE `allow`
+reply ran the command and cleared the prompt, and an AoE `deny` reply left the
+tool failed without running it. That build loads the default export's `server()`
+and reads its `plugin` config key with a file path.
+
+OpenCode `2.3.0` (`serve`) was verified the same way: `setup(ctx)` loaded, the
+extension published `running`/`idle` from the execution lifecycle, published
+`waiting` with a `permission.asked` prompt, and an AoE `allow` reply delivered
+through `ctx.permission.reply` ran the command. V2 question replies have no
+published API, so a question prompt cannot be answered from AoE there; OpenCode
+keeps its own dialog.
+
+Only these builds were exercised. Earlier 1.x releases share the V1 hook shape,
+and other 2.x betas may rename events before the API stabilizes.
 
 ### Unsupported versions and missing plugins
 
@@ -137,11 +146,10 @@ The tests cover the version gate, event classification, prompt mapping, reply
 validation and application, report file hardening, and the unsupported-version
 path. They run without an OpenCode install.
 
-Live verification against a real OpenCode release is still outstanding: no
-supported OpenCode build is installed in the development environment this
-integration was written in, so status parity with pane detection and reply
-delivery have not been exercised end to end. Run both artifacts against
-OpenCode 1.18.x and a 2.x beta before pinning a featured release.
+Live runs were driven with a local OpenAI-compatible stub model that asks for
+one `bash` command, so a permission prompt can be produced without provider
+credentials. Both verified builds are recorded above; rerun the same way against
+a new OpenCode release before widening the declared ranges.
 
 ## License
 

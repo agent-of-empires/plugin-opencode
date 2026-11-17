@@ -208,6 +208,19 @@ const STATUS_BY_KIND: ReadonlyMap<string, Status> = new Map([
   ["working", "running"],
 ]);
 
+/// V2 has no combined status event: an execution start and its terminal event
+/// are separate types, so map each to the status it announces.
+const V2_STATUS_BY_TYPE: ReadonlyMap<string, Status> = new Map([
+  ["session.execution.started", "running"],
+  ["session.execution.succeeded", "idle"],
+  ["session.execution.interrupted", "idle"],
+  ["session.execution.failed", "error"],
+  ["session.inbox.enqueued", "running"],
+  ["session.retry.scheduled", "running"],
+  ["session.compaction.started", "running"],
+  ["session.compaction.failed", "error"],
+]);
+
 const RUNNING_EVENTS = new Set([
   "tool.execute.before",
   "tool.execute.after",
@@ -216,6 +229,11 @@ const RUNNING_EVENTS = new Set([
   "question.rejected",
   "session.compacted",
   "chat.message",
+  "session.step.started",
+  "session.tool.called",
+  "session.tool.success",
+  "session.tool.failed",
+  "session.retry.scheduled",
 ]);
 
 const PROMPT_EVENTS = new Set(["permission.asked", "permission.v2.asked", "question.asked", "question.v2.asked"]);
@@ -247,12 +265,21 @@ function textOf(value: unknown): string | undefined {
 export function approvalPrompt(request: Record<string, any>): ApprovalPrompt | undefined {
   const id = textOf(request.id);
   if (!id) return undefined;
-  const action = textOf(request.permission) ?? "permission";
-  const patterns = Array.isArray(request.patterns)
-    ? request.patterns.filter((pattern: unknown) => typeof pattern === "string")
-    : [];
-  const detail = patterns.length > 0 ? `${action}: ${patterns.join(" ")}` : action;
-  return { kind: "approval", id, title: detail.slice(0, 200), allow_always: Array.isArray(request.always) && request.always.length > 0 };
+  // V1 asks with `permission`/`patterns`/`always`; V2 with `action`/`resources`/`save`.
+  const action = textOf(request.permission) ?? textOf(request.action) ?? "permission";
+  const patterns = [request.patterns, request.resources].find(Array.isArray) ?? [];
+  const labels = (patterns as unknown[]).filter(
+    (pattern): pattern is string => typeof pattern === "string",
+  );
+  const detail = labels.length > 0 ? `${action}: ${labels.join(" ")}` : action;
+  return {
+    kind: "approval",
+    id,
+    title: detail.slice(0, 200),
+    allow_always: [request.always, request.save].some(
+      (options) => Array.isArray(options) && options.length > 0,
+    ),
+  };
 }
 
 export function questionPrompt(request: Record<string, any>): QuestionPrompt | undefined {
@@ -297,15 +324,23 @@ export function questionPrompt(request: Record<string, any>): QuestionPrompt | u
 export function classify(event: unknown, tracker: Tracker): Outcome {
   const record = isRecord(event) ? event : {};
   const type = textOf(record.type);
-  const properties = isRecord(record.properties) ? record.properties : {};
+  // V1 puts event fields under `properties`; V2 delivers `data`.
+  const properties = isRecord(record.properties)
+    ? record.properties
+    : isRecord(record.data)
+      ? record.data
+      : {};
   if (!type) return { child: false };
 
   const info = isRecord(properties.info) ? properties.info : {};
   const sessionID = sessionIDOf(properties);
+  // V1 names the created session under `info`; V2 puts `parentID` beside it.
   const childSessionID =
-    typeof info.id === "string" && typeof info.parentID === "string" && info.parentID !== info.id
-      ? info.id
-      : undefined;
+    sessionID && typeof properties.parentID === "string" && properties.parentID !== sessionID
+      ? sessionID
+      : typeof info.id === "string" && typeof info.parentID === "string" && info.parentID !== info.id
+        ? info.id
+        : undefined;
   if (childSessionID) tracker.childSessions.add(childSessionID);
   const child = !!sessionID && tracker.childSessions.has(sessionID);
 
@@ -317,6 +352,10 @@ export function classify(event: unknown, tracker: Tracker): Outcome {
   }
   if (child) {
     return { child };
+  }
+  const v2Status = V2_STATUS_BY_TYPE.get(type);
+  if (v2Status) {
+    return { child, sessionID, status: v2Status };
   }
   if (type === "session.created") {
     return { child, sessionID, rootSessionID: sessionID };
