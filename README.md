@@ -37,11 +37,13 @@ One entrypoint serves both generations: OpenCode 1.x calls the default export's
 ### Unsupported versions and missing plugins
 
 On an unsupported version the extension logs one line naming the running
-version and the supported ranges, then goes inert. It publishes no report, calls
-no reply route, and OpenCode keeps its own prompts. AoE treats a report whose
-`provider_version` is outside the declared ranges as unsupported, leaves the
-session to its pane rules, and logs the reason, so status stays visible instead
-of turning into an owned `Unknown`.
+version and the supported ranges, publishes status only (no prompts, no reply
+keys), and calls no reply route. OpenCode keeps its own prompts and keymap.
+AoE treats a report whose `provider_version` is outside the declared ranges as
+unsupported, leaves the session to its pane rules, and logs the reported
+version and declared ranges, so status stays visible instead of turning into an
+owned `Unknown`. The status-only report is what lets the host read that version
+and say why it stepped aside.
 
 While the extension or the AoE plugin is missing, disabled, or unapproved, pane
 detection remains the status source. Installing the AoE plugin without the

@@ -311,7 +311,7 @@ test("the bridge publishes transitions, applies one reply, and ignores a stale d
   }
 });
 
-test("an unsupported provider version publishes nothing", async () => {
+test("an unsupported provider version publishes status without prompts or replies", async () => {
   const root = privateDirectory();
   try {
     const directory = path.join(root, INSTANCE);
@@ -322,13 +322,17 @@ test("an unsupported provider version publishes nothing", async () => {
       providerVersion: "3.0.0",
       uid: UID,
       pid: PID,
-      respond: async () => {},
+      respond: async () => {
+        throw new Error("an unsupported version must never reply");
+      },
     });
     await bridge.observe(event("session.created", { sessionID: "ses_root" }));
+    await bridge.observe(event("session.status", { sessionID: "ses_root", status: "busy" }));
     await bridge.observe(event("permission.asked", approvalRequest));
-    await bridge.flush();
-    expect(bridge.snapshot()).toBeUndefined();
-    expect(readdirSync(directory)).toEqual([]);
+    const snapshot = bridge.snapshot()!;
+    expect(snapshot).toMatchObject({ status: "running", prompt: null, reply_keys: [], provider_version: "3.0.0" });
+    writeFileSync(path.join(directory, REPLY_NAME), JSON.stringify(reply()), { mode: 0o600 });
+    expect(await bridge.pollReply()).toBe(false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

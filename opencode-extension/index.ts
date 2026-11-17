@@ -501,6 +501,9 @@ export type BridgeOptions = {
   directory: string;
   providerVersion: string;
   supported?: boolean;
+  /// False on an unsupported provider version: status still publishes so the
+  /// host can see the version, but no prompt is offered and no reply is read.
+  replies?: boolean;
   respond: Responder;
   uid?: number;
   pid?: number;
@@ -523,6 +526,7 @@ export function createBridge(options: BridgeOptions): Bridge {
   const pid = options.pid ?? process.pid;
   const log = options.log ?? (() => {});
   const supported = options.supported ?? isSupportedVersion(options.providerVersion);
+  const replies = options.replies ?? supported;
   const tracker = createTracker();
   let rootSessionID: string | undefined;
   let status: Status | undefined;
@@ -536,7 +540,7 @@ export function createBridge(options: BridgeOptions): Bridge {
 
   const current = (): Snapshot | undefined => {
     const sessionID = rootSessionID ?? undefined;
-    if (!supported || !sessionID || !status) return undefined;
+    if (!sessionID || !status) return undefined;
     return {
       schema_version: SNAPSHOT_SCHEMA_VERSION,
       instance_id: options.instanceId,
@@ -545,8 +549,8 @@ export function createBridge(options: BridgeOptions): Bridge {
       writer_pid: pid,
       revision,
       status: prompt ? "waiting" : status,
-      reply_keys: [REPLY_KEY],
-      prompt,
+      reply_keys: replies ? [REPLY_KEY] : [],
+      prompt: replies ? prompt : null,
     };
   };
 
@@ -566,22 +570,23 @@ export function createBridge(options: BridgeOptions): Bridge {
   };
 
   const observe = async (event: unknown): Promise<void> => {
-    if (!supported) return;
     const outcome = classify(event, tracker);
     if (outcome.rootSessionID) rootSessionID = outcome.rootSessionID;
     if (outcome.sessionID && !rootSessionID && !outcome.child) rootSessionID = outcome.sessionID;
-    if (outcome.prompt !== undefined) {
+    if (outcome.prompt !== undefined && replies) {
       const changed = JSON.stringify(outcome.prompt) !== JSON.stringify(prompt);
       prompt = outcome.prompt;
       if (changed) revision += 1;
     }
-    if (outcome.status) status = outcome.status;
+    // Without replies a prompt is none of this report's business, so it does
+    // not turn the status into a Waiting the host cannot act on.
+    if (outcome.status && !(outcome.prompt && !replies)) status = outcome.status;
     await flush();
   };
 
   const pollReply = async (): Promise<boolean> => {
     const snapshot = current();
-    if (!snapshot || !snapshot.prompt) return false;
+    if (!replies || !snapshot || !snapshot.prompt) return false;
     const reply = readReply(options.directory, uid, snapshot);
     if (!reply || applied.has(reply.response_id)) return false;
     applied.add(reply.response_id);
@@ -699,11 +704,11 @@ async function v1(input: Record<string, any>): Promise<Wiring | undefined> {
     log("could not read the OpenCode version; leaving status to pane detection");
     return undefined;
   }
-  if (!isSupportedVersion(version)) {
+  const supported = isSupportedVersion(version);
+  if (!supported) {
     log(
-      `OpenCode ${version} is not supported by this integration (supported: ${SUPPORTED_RANGES.join(" or ")}); leaving status and replies to OpenCode and AoE's pane detection`,
+      `OpenCode ${version} is outside this integration's supported versions (${SUPPORTED_RANGES.join(" or ")}); publishing status only so AoE keeps pane detection and OpenCode keeps its native prompts`,
     );
-    return undefined;
   }
   const uid = process.getuid?.() ?? 0;
   const hookDirectory = integrationDirectory(uid, instanceId);
@@ -715,6 +720,7 @@ async function v1(input: Record<string, any>): Promise<Wiring | undefined> {
     instanceId,
     directory: hookDirectory,
     providerVersion: version,
+    replies: supported,
     log,
     respond: async (prompt, reply) => {
       const call = providerReply(prompt, reply);
@@ -753,11 +759,11 @@ async function v2(ctx: Record<string, any>): Promise<Wiring | undefined> {
     log("could not read the OpenCode version; leaving status to pane detection");
     return undefined;
   }
-  if (!isSupportedVersion(version)) {
+  const supported = isSupportedVersion(version);
+  if (!supported) {
     log(
-      `OpenCode ${version} is not supported by this integration (supported: ${SUPPORTED_RANGES.join(" or ")}); leaving status and replies to OpenCode and AoE's pane detection`,
+      `OpenCode ${version} is outside this integration's supported versions (${SUPPORTED_RANGES.join(" or ")}); publishing status only so AoE keeps pane detection and OpenCode keeps its native prompts`,
     );
-    return undefined;
   }
   const uid = process.getuid?.() ?? 0;
   const hookDirectory = integrationDirectory(uid, instanceId);
@@ -769,6 +775,7 @@ async function v2(ctx: Record<string, any>): Promise<Wiring | undefined> {
     instanceId,
     directory: hookDirectory,
     providerVersion: version,
+    replies: supported,
     log,
     respond: async (prompt, reply) => {
       const call = providerReply(prompt, reply);
