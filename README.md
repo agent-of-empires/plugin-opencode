@@ -25,7 +25,7 @@ ranges before it activates:
 | Range | Notes |
 | --- | --- |
 | `>=1.18.29, <2.0.0` | OpenCode 1.x loads the default export's `server()`, and answers permissions through the server's reply routes. |
-| `>=2.0.0-0, <3.0.0` | OpenCode 2.x loads `setup(ctx)`, subscribes to the event bus, and replies through `ctx.permission.reply`. 2.x is still in beta; the plugin API may change, and a compatible extension release will be published when it does. V2 has no combined status event, so the extension maps the execution lifecycle (`session.execution.started` and its terminal events) onto AoE's statuses. |
+| `>=2.0.0-0, <3.0.0` | OpenCode 2.x loads `setup(ctx)`, subscribes to the event bus, and replies to permissions through `ctx.permission.reply`. Questions are forms there, so the TUI part answers those through `context.data.session.form.reply`. 2.x is still in beta; the plugin API may change, and a compatible extension release will be published when it does. V2 has no combined status event, so the extension maps the execution lifecycle (`session.execution.started` and its terminal events) onto AoE's statuses. |
 
 Prereleases are excluded from the 1.x range and included in the 2.x range.
 OpenCode 1.18.28 and earlier and OpenCode 3.x are not supported.
@@ -46,9 +46,14 @@ and reads its `plugin` config key with a file path.
 OpenCode `2.3.0` (`serve`) was verified the same way: `setup(ctx)` loaded, the
 extension published `running`/`idle` from the execution lifecycle, published
 `waiting` with a `permission.asked` prompt, and an AoE `allow` reply delivered
-through `ctx.permission.reply` ran the command. V2 question replies have no
-published API, so a question prompt cannot be answered from AoE there; OpenCode
-keeps its own dialog.
+through `ctx.permission.reply` ran the command.
+
+The 2.3.0 TUI part is verified only up to loading: its module shape matches the
+TUI loader's check, OpenCode resolves `<plugin directory>/tui` as the TUI
+entrypoint, and the form relay is covered by the tests against a recorded form
+shape. A live 2.x form has not been answered end to end: that needs a running
+2.x TUI, and the 2.3.0 TUI blocks at its terminal handshake in a headless tmux
+pane.
 
 Only these builds were exercised. Earlier 1.x releases share the V1 hook shape,
 and other 2.x betas may rename events before the API stabilizes.
@@ -73,15 +78,19 @@ installing the AoE plugin before the extension does not blank status.
 
 ### OpenCode extension
 
-OpenCode 1.x and 2.x both discover direct files in the plugin directory:
+OpenCode 1.x and 2.x both discover direct files in the plugin directory, and
+OpenCode 2.x resolves a plugin's `tui` entrypoint only through a plugin
+directory. Install both files as one directory:
 
 ```sh
-mkdir -p ~/.config/opencode/plugins
-cp opencode-extension/index.ts ~/.config/opencode/plugins/aoe-status.ts
+mkdir -p ~/.config/opencode/plugins/aoe-status
+cp opencode-extension/index.ts opencode-extension/tui.ts ~/.config/opencode/plugins/aoe-status/
 ```
 
-A configured plugin path must be a directory, so a single-file copy under the
-discovered `plugins/` directory is the portable option. See
+`index.ts` is the server part; `tui.ts` is the TUI part OpenCode loads beside
+it. A single-file copy (`aoe-status.ts`) still reports status and answers
+permissions and 1.x questions, but OpenCode 2 forms then stay in OpenCode,
+because only the TUI part can reply to one. See
 [OpenCode plugins](https://opencode.ai/docs/plugins/) for package-based installs.
 
 ### AoE plugin
@@ -105,6 +114,8 @@ hook directory, `/tmp/aoe-hooks-<euid>/<instance id>/integration-agent-of-empire
 | `session.status` `idle`, `session.idle` | Idle | |
 | `permission.asked` | Waiting | Approval, with `allow_always` when OpenCode offers saved approvals |
 | `question.asked` | Waiting | Question, one entry per asked question |
+| `form.created` | Waiting | Question, one entry per form field |
+| `form.replied`, `form.cancelled` | Running | Prompt cleared |
 | `permission.replied`, `question.replied`, `question.rejected` | Running | Prompt cleared |
 | `tool.execute.before`/`after`, `chat.message`, `session.compacted` | Running | |
 | `session.error` | Error | |
@@ -131,9 +142,12 @@ OpenCode remains the approval authority. This extension does not intercept tool
 execution, approve calls on AoE's behalf, or change OpenCode's ruleset. If
 reporting or reply delivery fails, OpenCode's native prompt stays available.
 
-OpenCode 2.x question replies need a `ctx.question.reply` API, which the current
-2.x beta does not document. When that API is absent the extension publishes the
-question but refuses the reply with a logged reason, and the prompt must be
+OpenCode 2.x asks through forms, not questions. The server context has no form
+API, so the server part publishes the form as an AoE question prompt and leaves
+the AoE reply on disk; the TUI part reads it, maps the selected labels back onto
+the form's option values, and submits the answer through
+`context.data.session.form.reply`. Without the TUI part (or when the form is
+missing or cannot be mapped completely) the prompt is published but must be
 answered in OpenCode.
 
 ## Development

@@ -1,6 +1,6 @@
 id = "agent-of-empires.opencode"
 name = "OpenCode Integration"
-version = "0.1.1"
+version = "0.2.0"
 api_version = 21
 aoe_version = ">=1.24.0, <2.0.0"
 description = "OpenCode-native session status and explicit approval/question replies through AoE's session list. Requires the separately installed OpenCode companion plugin."
