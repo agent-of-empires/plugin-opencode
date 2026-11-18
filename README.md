@@ -48,12 +48,12 @@ extension published `running`/`idle` from the execution lifecycle, published
 `waiting` with a `permission.asked` prompt, and an AoE `allow` reply delivered
 through `ctx.permission.reply` ran the command.
 
-The 2.3.0 TUI part is verified only up to loading: its module shape matches the
-TUI loader's check, OpenCode resolves `<plugin directory>/tui` as the TUI
-entrypoint, and the form relay is covered by the tests against a recorded form
-shape. A live 2.x form has not been answered end to end: that needs a running
-2.x TUI, and the 2.3.0 TUI blocks at its terminal handshake in a headless tmux
-pane.
+Form prompts were verified against 2.3.0 and 2.3.2 servers: creating a form in a
+session publishes `waiting` with a question prompt whose options carry the field
+labels. The TUI part is not reached: neither build loads a `./tui` part from a
+local plugin directory, whether the directory is listed in `opencode.json`, in
+`cli.json`, or next to a `package.json` exporting `./tui`. The AoE answer stays
+unread and the form keeps waiting, so answer 2.x forms in OpenCode.
 
 Only these builds were exercised. Earlier 1.x releases share the V1 hook shape,
 and other 2.x betas may rename events before the API stabilizes.
