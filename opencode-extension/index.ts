@@ -68,7 +68,7 @@ export type Reply = {
     | { kind: "question"; answers: Answer[] };
 };
 
-function isRecord(value: unknown): value is Record<string, any> {
+export function isRecord(value: unknown): value is Record<string, any> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
@@ -249,6 +249,8 @@ export type Outcome = {
   sessionID?: string;
   status?: Status;
   prompt?: Prompt | null;
+  /// The prompt is an OpenCode 2 form, which only the TUI part can answer.
+  form?: boolean;
   child: boolean;
 };
 
@@ -318,6 +320,42 @@ export function questionPrompt(request: Record<string, any>): QuestionPrompt | u
   };
 }
 
+/// OpenCode 2 asks the user through a form, not a question: the same prompt
+/// surface under another name, with one field per question.
+export function formPrompt(form: Record<string, any>): QuestionPrompt | undefined {
+  const id = textOf(form.id);
+  if (!id) return undefined;
+  const raw = Array.isArray(form.fields) ? form.fields : [];
+  const questions: Question[] = [];
+  for (const entry of raw) {
+    if (!isRecord(entry) || entry.hidden === true) continue;
+    // An external field is a link the form opens, not a value to collect.
+    if (entry.type === "external") continue;
+    const key = textOf(entry.key);
+    if (!key) return undefined;
+    const options = Array.isArray(entry.options) ? entry.options : [];
+    const mapped: Question["options"] = [];
+    for (const option of options) {
+      if (!isRecord(option)) return undefined;
+      const label = textOf(option.label);
+      if (!label) return undefined;
+      mapped.push({ label, description: textOf(option.description) ?? null });
+    }
+    // Form fields without options (string, number, boolean) still take a
+    // typed answer, which the host offers as custom input.
+    questions.push({
+      id: key,
+      question: textOf(entry.title) ?? textOf(entry.description) ?? key,
+      options: mapped,
+      multi: entry.type === "multiselect",
+      recommended: null,
+    });
+  }
+  if (questions.length === 0) return undefined;
+  const title = textOf(form.title) ?? questions.map((question) => question.question).join("\n");
+  return { kind: "question", id, title: title.slice(0, 400), questions };
+}
+
 /// Classify one OpenCode bus event. Unknown events change nothing; events from
 /// a child (subagent) session never move the root session's status, but a
 /// prompt raised there still has to be answerable.
@@ -349,6 +387,20 @@ export function classify(event: unknown, tracker: Tracker): Outcome {
   }
   if (type === "question.asked" || type === "question.v2.asked") {
     return { child, sessionID, prompt: questionPrompt(properties) ?? null, status: "waiting" };
+  }
+  if (type === "form.created") {
+    const form = isRecord(properties.form) ? properties.form : {};
+    const formSessionID = textOf(form.sessionID) ?? sessionID;
+    return {
+      child,
+      sessionID: formSessionID,
+      prompt: formPrompt(form) ?? null,
+      status: "waiting",
+      form: true,
+    };
+  }
+  if (type === "form.replied" || type === "form.cancelled") {
+    return { child, sessionID, status: "running", prompt: null };
   }
   if (child) {
     return { child };
@@ -516,6 +568,46 @@ export async function writeSnapshot(directory: string, snapshot: Snapshot): Prom
   await rename(temporary, target);
 }
 
+/// Read the report this instance published, for the TUI part that answers
+/// OpenCode 2 forms: an AoE reply for a form has no server-side reply API.
+export function readSnapshot(directory: string, uid: number, instanceId: string): Snapshot | undefined {
+  const file = path.join(directory, SNAPSHOT_NAME);
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const stat = fstatSync(descriptor);
+    if (!stat.isFile() || stat.uid !== uid || (stat.mode & 0o7777) !== 0o600 || stat.size > MAX_FILE_BYTES) {
+      return undefined;
+    }
+    const value: unknown = JSON.parse(readFileSync(descriptor, "utf8"));
+    if (
+      !isRecord(value) ||
+      value.schema_version !== SNAPSHOT_SCHEMA_VERSION ||
+      value.instance_id !== instanceId ||
+      typeof value.provider_session_id !== "string" ||
+      typeof value.writer_pid !== "number" ||
+      typeof value.revision !== "number" ||
+      typeof value.status !== "string"
+    ) {
+      return undefined;
+    }
+    return value as Snapshot;
+  } catch {
+    return undefined;
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+export function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function readReply(directory: string, uid: number, snapshot: Snapshot): Reply | undefined {
   const file = path.join(directory, REPLY_NAME);
   let descriptor: number | undefined;
@@ -573,6 +665,7 @@ export function createBridge(options: BridgeOptions): Bridge {
   let rootSessionID: string | undefined;
   let status: Status | undefined;
   let prompt: Prompt | null = null;
+  let formPrompt = false;
   let revision = 1;
   let written: string | undefined;
   let lastWrite = 0;
@@ -625,6 +718,7 @@ export function createBridge(options: BridgeOptions): Bridge {
     if (outcome.prompt !== undefined && replies) {
       const changed = JSON.stringify(outcome.prompt) !== JSON.stringify(prompt);
       prompt = outcome.prompt;
+      formPrompt = outcome.form === true;
       if (changed) revision += 1;
     }
     // Without replies a prompt is none of this report's business, so it does
@@ -638,6 +732,9 @@ export function createBridge(options: BridgeOptions): Bridge {
     if (!replies || !snapshot || !snapshot.prompt) return false;
     const reply = readReply(options.directory, uid, snapshot);
     if (!reply || applied.has(reply.response_id)) return false;
+    // A form has no server-side reply API; the TUI part reads this same
+    // response and answers it, so leave the file for that part.
+    if (formPrompt && reply.response.kind === "question") return false;
     applied.add(reply.response_id);
     try {
       await options.respond(snapshot.prompt, reply);
@@ -707,7 +804,7 @@ export function resolveInstanceId(
   return /^[A-Za-z0-9_-]{1,128}$/.test(value) ? value : undefined;
 }
 
-function runSync(file: string, args: string[]): string | undefined {
+export function runSync(file: string, args: string[]): string | undefined {
   try {
     return execFileSync(file, args, { encoding: "utf8", timeout: 1_000 });
   } catch {
