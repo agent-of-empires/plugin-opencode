@@ -11,7 +11,11 @@ artifacts, the same split the paired OMP integration uses:
   install is refused until core's featured index pins a release of this
   repository.
 - `opencode-extension/index.ts` is the provider-native OpenCode plugin. It is
-  loaded inside OpenCode and observes OpenCode's own event bus.
+  loaded inside OpenCode and observes OpenCode's own event bus. OpenCode 2.x
+  loads `tui.ts` beside it as the TUI part, and only when that directory is
+  listed under `plugin` in `~/.config/opencode/cli.json` as well: that file
+  spells the key `plugin`, and an `opencode.json` entry loads the server part
+  alone.
 
 Neither artifact configures the other. Install both, and restart OpenCode after
 installing the extension: a running OpenCode process does not load a plugin it
@@ -48,12 +52,12 @@ extension published `running`/`idle` from the execution lifecycle, published
 `waiting` with a `permission.asked` prompt, and an AoE `allow` reply delivered
 through `ctx.permission.reply` ran the command.
 
-Form prompts were verified against 2.3.0 and 2.3.2 servers: creating a form in a
-session publishes `waiting` with a question prompt whose options carry the field
-labels. The TUI part is not reached: neither build loads a `./tui` part from a
-local plugin directory, whether the directory is listed in `opencode.json`, in
-`cli.json`, or next to a `package.json` exporting `./tui`. The AoE answer stays
-unread and the form keeps waiting, so answer 2.x forms in OpenCode.
+OpenCode `2.3.2` answered a form end to end. A form created in a session
+published `waiting` with a question prompt whose options carry the field labels,
+an AoE answer written to the reply file closed the form and the TUI part removed
+the file. The TUI part loads only when the plugin directory is also listed under
+`plugin` in `cli.json`; an `opencode.json` entry loads the server part alone, and
+that file spells the key `plugin`, so a `plugins` list there is ignored.
 
 Only these builds were exercised. Earlier 1.x releases share the V1 hook shape,
 and other 2.x betas may rename events before the API stabilizes.
