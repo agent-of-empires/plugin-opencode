@@ -1,10 +1,11 @@
 import { expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 import {
   REPLY_NAME,
+  SESSION_ID_NAME,
   SNAPSHOT_NAME,
   SUPPORTED_RANGES,
   approvalPrompt,
@@ -13,12 +14,14 @@ import {
   createTracker,
   ensurePrivateDirectories,
   integrationDirectory,
+  integrationPaths,
   isSupportedVersion,
   providerReply,
   questionPrompt,
   readReply,
   resolveInstanceId,
   satisfies,
+  sessionIdLeaf,
   validateReply,
   writeSnapshot,
 } from "../opencode-extension/index.ts";
@@ -333,7 +336,8 @@ test("a heartbeat publish racing an event publish cannot fail the flush", async 
         bridge.flush(),
         bridge.flush(),
       ]);
-      expect(readdirSync(directory)).toEqual([SNAPSHOT_NAME]);
+      expect(readdirSync(directory).sort()).toEqual([SNAPSHOT_NAME, SESSION_ID_NAME]);
+      expect(readFileSync(path.join(directory, SESSION_ID_NAME), "utf8")).toBe("ses_root");
       expect(bridge.snapshot()?.status).toBe("running");
     } finally {
       bridge.stop();
@@ -421,4 +425,44 @@ test("instance identity comes from AoE's environment or the pane's tmux environm
   expect(resolveInstanceId({ TMUX_PANE: "%4" }, () => "AOE_INSTANCE_ID=bad id")).toBeUndefined();
   expect(resolveInstanceId({}, () => undefined)).toBeUndefined();
   expect(integrationDirectory(501, "instance-a")).toBe("/tmp/aoe-hooks-501/instance-a");
+});
+
+test("a launch names the integration directory and the leaf its id belongs to", () => {
+  expect(integrationPaths({}, 501, "instance-a")).toEqual({
+    root: "/tmp/aoe-hooks-501",
+    dir: "/tmp/aoe-hooks-501/instance-a",
+  });
+  expect(integrationPaths({ AOE_INTEGRATION_DIR: "/tmp/aoe-hooks/instance-a" }, 501, "instance-a")).toEqual({
+    root: "/tmp/aoe-hooks",
+    dir: "/tmp/aoe-hooks/instance-a",
+  });
+  const launchId = "7d442dd2-7b10-4cc4-9207-123456789abc";
+  expect(sessionIdLeaf(launchId)).toBe(`session_id.${launchId}`);
+  expect(sessionIdLeaf(undefined)).toBe("session_id");
+  expect(sessionIdLeaf("not-a-launch-id")).toBe("session_id");
+  expect(sessionIdLeaf("7D442DD2-7B10-4CC4-9207-123456789ABC")).toBe("session_id");
+});
+
+test("the bridge publishes the root conversation id next to its report", async () => {
+  const directory = privateDirectory();
+  const launchId = "7d442dd2-7b10-4cc4-9207-123456789abc";
+  const leaf = sessionIdLeaf(launchId);
+  const bridge = createBridge({
+    instanceId: INSTANCE,
+    directory,
+    providerVersion: VERSION,
+    uid: UID,
+    pid: PID,
+    sessionIdLeaf: leaf,
+    respond: async () => {},
+  });
+  try {
+    await bridge.observe(event("session.created", { sessionID: "ses_root" }));
+    await bridge.observe(event("session.status", { sessionID: "ses_root", status: "busy" }));
+    expect(readFileSync(path.join(directory, leaf), "utf8")).toBe("ses_root");
+    expect(statSync(path.join(directory, leaf)).mode & 0o777).toBe(0o600);
+  } finally {
+    bridge.stop();
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

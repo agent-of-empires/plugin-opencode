@@ -22,6 +22,13 @@ export const HEARTBEAT_MS = 5_000;
 export const REPLY_POLL_MS = 250;
 export const MAX_FILE_BYTES = 65_536;
 export const REPLY_KEY = "F12";
+// The launch names the directory it mounted and the launch id that scopes the
+// sidecar, because a sandboxed provider cannot derive either from a uid it does
+// not have on the host.
+export const INTEGRATION_DIR_ENV = "AOE_INTEGRATION_DIR";
+export const SESSION_SOURCE_ENV = "AOE_SESSION_SOURCE";
+export const SESSION_ID_NAME = "session_id";
+const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 let tempSequence = 0;
 
@@ -532,6 +539,19 @@ export function integrationDirectory(uid: number, instanceId: string): string {
   return path.join("/tmp", `aoe-hooks-${uid}`, instanceId);
 }
 
+export function integrationPaths(env: NodeJS.ProcessEnv, uid: number, instanceId: string): { root: string; dir: string } {
+  const configured = env[INTEGRATION_DIR_ENV]?.trim();
+  const dir = configured && path.isAbsolute(configured) ? configured : integrationDirectory(uid, instanceId);
+  return { root: path.dirname(dir), dir };
+}
+
+/// Mirrors the host's leaf rule. Only a canonical launch id scopes the sidecar,
+/// so an earlier launch's id is never read as this launch's identity.
+export function sessionIdLeaf(source: string | undefined): string {
+  const trimmed = source?.trim();
+  return trimmed && CANONICAL_UUID.test(trimmed) ? `${SESSION_ID_NAME}.${trimmed}` : SESSION_ID_NAME;
+}
+
 function safeDirectorySync(directory: string, uid: number): boolean {
   try {
     const stat = lstatSync(directory);
@@ -566,6 +586,20 @@ export async function writeSnapshot(directory: string, snapshot: Snapshot): Prom
     await handle.close();
   }
   await rename(temporary, target);
+}
+
+/// The host stores this as the conversation to resume, so the id it names must
+/// be the root conversation, not a subagent's.
+export async function writeSessionId(directory: string, leaf: string, sessionId: string): Promise<void> {
+  const temporary = path.join(directory, `.${leaf}.${process.pid}.${tempSequence++}.tmp`);
+  const handle = await open(temporary, "w", 0o600);
+  try {
+    await handle.write(Buffer.from(sessionId, "utf8"));
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await rename(temporary, path.join(directory, leaf));
 }
 
 /// Read the report this instance published, for the TUI part that answers
@@ -643,6 +677,8 @@ export type BridgeOptions = {
   pid?: number;
   heartbeatMs?: number;
   pollMs?: number;
+  /// Launch-scoped sidecar leaf; defaults to the launch's `AOE_SESSION_SOURCE`.
+  sessionIdLeaf?: string;
   log?: (message: string) => void;
 };
 
@@ -662,6 +698,7 @@ export function createBridge(options: BridgeOptions): Bridge {
   const supported = options.supported ?? isSupportedVersion(options.providerVersion);
   const replies = options.replies ?? supported;
   const tracker = createTracker();
+  const leaf = options.sessionIdLeaf ?? sessionIdLeaf(process.env[SESSION_SOURCE_ENV]);
   let rootSessionID: string | undefined;
   let status: Status | undefined;
   let prompt: Prompt | null = null;
@@ -698,6 +735,7 @@ export function createBridge(options: BridgeOptions): Bridge {
     if (serialized === written && now - lastWrite < (options.heartbeatMs ?? HEARTBEAT_MS)) return;
     try {
       await writeSnapshot(options.directory, snapshot);
+      await writeSessionId(options.directory, leaf, snapshot.provider_session_id);
       written = serialized;
       lastWrite = now;
     } catch (error) {
@@ -857,8 +895,8 @@ async function v1(input: Record<string, any>): Promise<Wiring | undefined> {
     );
   }
   const uid = process.getuid?.() ?? 0;
-  const hookDirectory = integrationDirectory(uid, instanceId);
-  if (!(await ensurePrivateDirectories(path.dirname(hookDirectory), hookDirectory, uid))) {
+  const { root, dir: hookDirectory } = integrationPaths(process.env, uid, instanceId);
+  if (!(await ensurePrivateDirectories(root, hookDirectory, uid))) {
     log(`could not secure ${hookDirectory}; leaving status to pane detection`);
     return undefined;
   }
@@ -912,8 +950,8 @@ async function v2(ctx: Record<string, any>): Promise<Wiring | undefined> {
     );
   }
   const uid = process.getuid?.() ?? 0;
-  const hookDirectory = integrationDirectory(uid, instanceId);
-  if (!(await ensurePrivateDirectories(path.dirname(hookDirectory), hookDirectory, uid))) {
+  const { root, dir: hookDirectory } = integrationPaths(process.env, uid, instanceId);
+  if (!(await ensurePrivateDirectories(root, hookDirectory, uid))) {
     log(`could not secure ${hookDirectory}; leaving status to pane detection`);
     return undefined;
   }
