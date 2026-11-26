@@ -16,7 +16,7 @@ import path from "node:path";
 import {
   REPLY_NAME,
   REPLY_POLL_MS,
-  integrationDirectory,
+  integrationPaths,
   isRecord,
   processAlive,
   readReply,
@@ -245,7 +245,7 @@ async function setup(context: TuiContext): Promise<(() => void) | undefined> {
     return undefined;
   }
   const uid = process.getuid?.() ?? 0;
-  const directory = integrationDirectory(uid, instanceId);
+  const { dir: directory } = integrationPaths(process.env, uid, instanceId);
   const relay = createFormRelay({ context, instanceId, directory, uid, log });
   log(`watching form prompts in ${directory}`);
   relay.start();

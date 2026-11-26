@@ -539,10 +539,20 @@ export function integrationDirectory(uid: number, instanceId: string): string {
   return path.join("/tmp", `aoe-hooks-${uid}`, instanceId);
 }
 
-export function integrationPaths(env: NodeJS.ProcessEnv, uid: number, instanceId: string): { root: string; dir: string } {
+/// `managed` says whether the leaf lives under the namespace this extension
+/// creates. A configured directory answers to its owner, so its parent is not
+/// ours to create or to make private.
+export function integrationPaths(
+  env: NodeJS.ProcessEnv,
+  uid: number,
+  instanceId: string,
+): { root: string; dir: string; managed: boolean } {
   const configured = env[INTEGRATION_DIR_ENV]?.trim();
-  const dir = configured && path.isAbsolute(configured) ? configured : integrationDirectory(uid, instanceId);
-  return { root: path.dirname(dir), dir };
+  if (configured && path.isAbsolute(configured)) {
+    return { root: path.dirname(configured), dir: configured, managed: false };
+  }
+  const dir = integrationDirectory(uid, instanceId);
+  return { root: path.dirname(dir), dir, managed: true };
 }
 
 /// Mirrors the host's leaf rule. Only a canonical launch id scopes the sidecar,
@@ -561,8 +571,13 @@ function safeDirectorySync(directory: string, uid: number): boolean {
   }
 }
 
-export async function ensurePrivateDirectories(root: string, directory: string, uid: number): Promise<boolean> {
-  for (const entry of [root, directory]) {
+export async function ensurePrivateDirectories(
+  root: string,
+  directory: string,
+  uid: number,
+  managedRoot = true,
+): Promise<boolean> {
+  for (const entry of managedRoot ? [root, directory] : [directory]) {
     try {
       await mkdir(entry, { mode: 0o700 });
     } catch (error) {
@@ -895,8 +910,8 @@ async function v1(input: Record<string, any>): Promise<Wiring | undefined> {
     );
   }
   const uid = process.getuid?.() ?? 0;
-  const { root, dir: hookDirectory } = integrationPaths(process.env, uid, instanceId);
-  if (!(await ensurePrivateDirectories(root, hookDirectory, uid))) {
+  const { root, dir: hookDirectory, managed } = integrationPaths(process.env, uid, instanceId);
+  if (!(await ensurePrivateDirectories(root, hookDirectory, uid, managed))) {
     log(`could not secure ${hookDirectory}; leaving status to pane detection`);
     return undefined;
   }
@@ -950,8 +965,8 @@ async function v2(ctx: Record<string, any>): Promise<Wiring | undefined> {
     );
   }
   const uid = process.getuid?.() ?? 0;
-  const { root, dir: hookDirectory } = integrationPaths(process.env, uid, instanceId);
-  if (!(await ensurePrivateDirectories(root, hookDirectory, uid))) {
+  const { root, dir: hookDirectory, managed } = integrationPaths(process.env, uid, instanceId);
+  if (!(await ensurePrivateDirectories(root, hookDirectory, uid, managed))) {
     log(`could not secure ${hookDirectory}; leaving status to pane detection`);
     return undefined;
   }

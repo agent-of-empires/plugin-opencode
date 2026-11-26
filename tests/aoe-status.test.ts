@@ -300,6 +300,20 @@ test("reports round-trip through a private directory and replies are read back",
   }
 });
 
+test("a configured directory needs no private parent, unlike the managed namespace", async () => {
+  const parent = privateDirectory();
+  try {
+    chmodSync(parent, 0o755);
+    const configured = path.join(parent, INSTANCE);
+    expect(await ensurePrivateDirectories(parent, configured, UID, false)).toBe(true);
+    expect(statSync(configured).mode & 0o777).toBe(0o700);
+    // The namespace this extension creates still requires both levels.
+    expect(await ensurePrivateDirectories(parent, path.join(parent, "managed"), UID)).toBe(false);
+  } finally {
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
 test("concurrent publishes settle on one file and leave no temporary behind", async () => {
   const root = privateDirectory();
   try {
@@ -326,6 +340,8 @@ test("a heartbeat publish racing an event publish cannot fail the flush", async 
       providerVersion: VERSION,
       uid: UID,
       pid: PID,
+      // Explicit, so an inherited AOE_SESSION_SOURCE cannot move the leaf.
+      sessionIdLeaf: SESSION_ID_NAME,
       respond: async () => {},
     });
     bridge.start();
@@ -431,10 +447,12 @@ test("a launch names the integration directory and the leaf its id belongs to", 
   expect(integrationPaths({}, 501, "instance-a")).toEqual({
     root: "/tmp/aoe-hooks-501",
     dir: "/tmp/aoe-hooks-501/instance-a",
+    managed: true,
   });
   expect(integrationPaths({ AOE_INTEGRATION_DIR: "/tmp/aoe-hooks/instance-a" }, 501, "instance-a")).toEqual({
     root: "/tmp/aoe-hooks",
     dir: "/tmp/aoe-hooks/instance-a",
+    managed: false,
   });
   const launchId = "7d442dd2-7b10-4cc4-9207-123456789abc";
   expect(sessionIdLeaf(launchId)).toBe(`session_id.${launchId}`);
