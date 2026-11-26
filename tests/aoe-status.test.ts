@@ -1,10 +1,11 @@
 import { expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, symlinkSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 import {
   REPLY_NAME,
+  SESSION_ID_NAME,
   SNAPSHOT_NAME,
   SUPPORTED_RANGES,
   approvalPrompt,
@@ -13,13 +14,16 @@ import {
   createTracker,
   ensurePrivateDirectories,
   integrationDirectory,
+  integrationPaths,
   isSupportedVersion,
   providerReply,
   questionPrompt,
   readReply,
   resolveInstanceId,
   satisfies,
+  sessionIdLeaf,
   validateReply,
+  writeSessionId,
   writeSnapshot,
 } from "../opencode-extension/index.ts";
 
@@ -297,6 +301,89 @@ test("reports round-trip through a private directory and replies are read back",
   }
 });
 
+test("a configured directory needs a parent others cannot write, but not a private one", async () => {
+  const parent = privateDirectory();
+  try {
+    // Root-owned or ordinary 0755 parents are fine: nobody else can rename the
+    // leaf, so only the leaf has to be private and provider-owned.
+    chmodSync(parent, 0o755);
+    const configured = path.join(parent, INSTANCE);
+    expect(await ensurePrivateDirectories(parent, configured, UID, false)).toBe(true);
+    expect(statSync(configured).mode & 0o777).toBe(0o700);
+    // The namespace this extension creates still requires both levels.
+    expect(await ensurePrivateDirectories(parent, path.join(parent, "managed"), UID)).toBe(false);
+
+    // A parent another user can add or rename entries in lets them swap the
+    // private leaf after this check, so it is refused.
+    chmodSync(parent, 0o777);
+    expect(await ensurePrivateDirectories(parent, path.join(parent, "swappable"), UID, false)).toBe(false);
+
+    // The sticky bit is what makes a shared directory safe, which is how a
+    // configured directory under /tmp stays usable.
+    chmodSync(parent, 0o1777);
+    expect(await ensurePrivateDirectories(parent, path.join(parent, "sticky"), UID, false)).toBe(true);
+
+    // A writable ancestor is just as good a way to swap the leaf, so the whole
+    // chain is checked, not only the immediate parent.
+    chmodSync(parent, 0o755);
+    const open = path.join(parent, "open");
+    mkdirSync(open);
+    chmodSync(open, 0o777);
+    const nested = path.join(open, "ns", INSTANCE);
+    mkdirSync(path.join(open, "ns"));
+    chmodSync(path.join(open, "ns"), 0o755);
+    expect(await ensurePrivateDirectories(path.join(open, "ns"), nested, UID, false)).toBe(false);
+  } finally {
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test("a configured directory follows a trusted alias but not an untrusted one", async () => {
+  const root = privateDirectory();
+  try {
+    const real = path.join(root, "real");
+    mkdirSync(real, { mode: 0o755 });
+    const alias = path.join(root, "alias");
+    // Relative, the way a link under a shared directory usually is.
+    symlinkSync("real", alias);
+    // This uid owns the alias and nobody else can replace it, which is how a
+    // configured directory under /tmp on macOS works, since /tmp is a symlink.
+    expect(await ensurePrivateDirectories(alias, path.join(alias, INSTANCE), UID, false)).toBe(true);
+    // A link inside the target of another link is followed and checked too, so
+    // the hop count is not a way around the rules.
+    const outer = path.join(root, "outer");
+    symlinkSync(alias, outer);
+    expect(await ensurePrivateDirectories(outer, path.join(outer, INSTANCE), UID, false)).toBe(true);
+    // A trusted alias is not enough if it leads into a directory another user
+    // can write to, so the resolved ancestors are checked as well.
+    const open = path.join(root, "open");
+    mkdirSync(open);
+    chmodSync(open, 0o777);
+    const deep = path.join(open, "deep");
+    mkdirSync(deep);
+    const unsafeAlias = path.join(root, "unsafe-alias");
+    symlinkSync(deep, unsafeAlias);
+    expect(await ensurePrivateDirectories(unsafeAlias, path.join(unsafeAlias, INSTANCE), UID, false)).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a failed publication leaves no temporary file behind", async () => {
+  const root = privateDirectory();
+  try {
+    const directory = path.join(root, INSTANCE);
+    await ensurePrivateDirectories(root, directory, UID);
+    // A directory at the target makes `rename` fail after the temporary file is
+    // written and closed.
+    mkdirSync(path.join(directory, SESSION_ID_NAME));
+    await expect(writeSessionId(directory, SESSION_ID_NAME, "ses_root")).rejects.toThrow();
+    expect(readdirSync(directory)).toEqual([SESSION_ID_NAME]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("concurrent publishes settle on one file and leave no temporary behind", async () => {
   const root = privateDirectory();
   try {
@@ -323,6 +410,8 @@ test("a heartbeat publish racing an event publish cannot fail the flush", async 
       providerVersion: VERSION,
       uid: UID,
       pid: PID,
+      // Explicit, so an inherited AOE_SESSION_SOURCE cannot move the leaf.
+      sessionIdLeaf: SESSION_ID_NAME,
       respond: async () => {},
     });
     bridge.start();
@@ -333,7 +422,8 @@ test("a heartbeat publish racing an event publish cannot fail the flush", async 
         bridge.flush(),
         bridge.flush(),
       ]);
-      expect(readdirSync(directory)).toEqual([SNAPSHOT_NAME]);
+      expect(readdirSync(directory).sort()).toEqual([SNAPSHOT_NAME, SESSION_ID_NAME]);
+      expect(readFileSync(path.join(directory, SESSION_ID_NAME), "utf8")).toBe("ses_root");
       expect(bridge.snapshot()?.status).toBe("running");
     } finally {
       bridge.stop();
@@ -421,4 +511,46 @@ test("instance identity comes from AoE's environment or the pane's tmux environm
   expect(resolveInstanceId({ TMUX_PANE: "%4" }, () => "AOE_INSTANCE_ID=bad id")).toBeUndefined();
   expect(resolveInstanceId({}, () => undefined)).toBeUndefined();
   expect(integrationDirectory(501, "instance-a")).toBe("/tmp/aoe-hooks-501/instance-a");
+});
+
+test("a launch names the integration directory and the leaf its id belongs to", () => {
+  expect(integrationPaths({}, 501, "instance-a")).toEqual({
+    root: "/tmp/aoe-hooks-501",
+    dir: "/tmp/aoe-hooks-501/instance-a",
+    managed: true,
+  });
+  expect(integrationPaths({ AOE_INTEGRATION_DIR: "/tmp/aoe-hooks/instance-a" }, 501, "instance-a")).toEqual({
+    root: "/tmp/aoe-hooks",
+    dir: "/tmp/aoe-hooks/instance-a",
+    managed: false,
+  });
+  const launchId = "7d442dd2-7b10-4cc4-9207-123456789abc";
+  expect(sessionIdLeaf(launchId)).toBe(`session_id.${launchId}`);
+  expect(sessionIdLeaf(undefined)).toBe("session_id");
+  expect(sessionIdLeaf("not-a-launch-id")).toBe("session_id");
+  expect(sessionIdLeaf("7D442DD2-7B10-4CC4-9207-123456789ABC")).toBe("session_id");
+});
+
+test("the bridge publishes the root conversation id next to its report", async () => {
+  const directory = privateDirectory();
+  const launchId = "7d442dd2-7b10-4cc4-9207-123456789abc";
+  const leaf = sessionIdLeaf(launchId);
+  const bridge = createBridge({
+    instanceId: INSTANCE,
+    directory,
+    providerVersion: VERSION,
+    uid: UID,
+    pid: PID,
+    sessionIdLeaf: leaf,
+    respond: async () => {},
+  });
+  try {
+    await bridge.observe(event("session.created", { sessionID: "ses_root" }));
+    await bridge.observe(event("session.status", { sessionID: "ses_root", status: "busy" }));
+    expect(readFileSync(path.join(directory, leaf), "utf8")).toBe("ses_root");
+    expect(statSync(path.join(directory, leaf)).mode & 0o777).toBe(0o600);
+  } finally {
+    bridge.stop();
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

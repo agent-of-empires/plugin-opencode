@@ -11,7 +11,9 @@
 //   * OpenCode 2.x loads `setup(ctx)` and subscribes to the event bus.
 
 import { execFileSync } from "node:child_process";
-import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readlinkSync } from "node:fs";
+import type { Stats } from "node:fs";
 import { mkdir, open, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 
@@ -22,8 +24,21 @@ export const HEARTBEAT_MS = 5_000;
 export const REPLY_POLL_MS = 250;
 export const MAX_FILE_BYTES = 65_536;
 export const REPLY_KEY = "F12";
+// The launch names the directory it mounted and the launch id that scopes the
+// sidecar, because a sandboxed provider cannot derive either from a uid it does
+// not have on the host.
+export const INTEGRATION_DIR_ENV = "AOE_INTEGRATION_DIR";
+export const SESSION_SOURCE_ENV = "AOE_SESSION_SOURCE";
+export const SESSION_ID_NAME = "session_id";
+const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
-let tempSequence = 0;
+/// A publish target that cannot be guessed or planted before it is written. The
+/// name is random rather than a pid/counter, and the write opens it with
+/// O_EXCL, so a file already at that path is an error instead of a file this
+/// report is written into.
+function temporaryName(directory: string, leaf: string): string {
+  return path.join(directory, `.${leaf}.${randomBytes(8).toString("hex")}.tmp`);
+}
 
 /// Declared in `aoe-plugin.toml` as well. The host decides compatibility from
 /// the published version; this copy keeps an unsupported runtime from driving
@@ -532,6 +547,29 @@ export function integrationDirectory(uid: number, instanceId: string): string {
   return path.join("/tmp", `aoe-hooks-${uid}`, instanceId);
 }
 
+/// `managed` says whether the leaf lives under the namespace this extension
+/// creates. A configured directory answers to its owner, so its parent is not
+/// ours to create or to make private.
+export function integrationPaths(
+  env: NodeJS.ProcessEnv,
+  uid: number,
+  instanceId: string,
+): { root: string; dir: string; managed: boolean } {
+  const configured = env[INTEGRATION_DIR_ENV]?.trim();
+  if (configured && path.isAbsolute(configured)) {
+    return { root: path.dirname(configured), dir: configured, managed: false };
+  }
+  const dir = integrationDirectory(uid, instanceId);
+  return { root: path.dirname(dir), dir, managed: true };
+}
+
+/// Mirrors the host's leaf rule. Only a canonical launch id scopes the sidecar,
+/// so an earlier launch's id is never read as this launch's identity.
+export function sessionIdLeaf(source: string | undefined): string {
+  const trimmed = source?.trim();
+  return trimmed && CANONICAL_UUID.test(trimmed) ? `${SESSION_ID_NAME}.${trimmed}` : SESSION_ID_NAME;
+}
+
 function safeDirectorySync(directory: string, uid: number): boolean {
   try {
     const stat = lstatSync(directory);
@@ -541,8 +579,73 @@ function safeDirectorySync(directory: string, uid: number): boolean {
   }
 }
 
-export async function ensurePrivateDirectories(root: string, directory: string, uid: number): Promise<boolean> {
-  for (const entry of [root, directory]) {
+/// Whether another user cannot add or rename entries in `directory`. A parent
+/// that is not ours to own still has to be closed to others: a group or world
+/// writable directory without the sticky bit lets them swap the private leaf
+/// for one of their own after it is validated. `/tmp`, owned by root at 1777,
+/// passes on the sticky bit, which is why a configured directory under it stays
+/// usable. The sticky bit only counts under an owner this process trusts,
+/// because a sticky directory's owner is exempt from it and could rename the
+/// leaf.
+function lstatOrNull(target: string): Stats | undefined {
+  try {
+    return lstatSync(target);
+  } catch {
+    return undefined;
+  }
+}
+
+/// One safe parent does not help if a directory above it is replaceable: with
+/// `/srv/shared` open at 0777, another user can rename a provider-owned `ns`
+/// out of the way and put their own tree in its place. `realpath` is no better
+/// here, because it follows a link another user owns and reports only the
+/// destination it happens to reach now.
+///
+/// Walk the path one component at a time instead, following links explicitly and
+/// checking each hop the same way: a directory another user can write to lets
+/// them swap what comes next, and a link they own lets them repoint it. This is
+/// how `/tmp` stays usable, as it is a root-owned link on macOS and a sticky
+/// root-owned directory elsewhere.
+function safeAncestrySync(directory: string, uid: number): boolean {
+  const pending = path.dirname(directory).split(path.sep).filter((part) => part.length > 0);
+  let current = path.sep;
+  let hops = 0;
+  while (pending.length > 0) {
+    const part = pending.shift()!;
+    if (part === ".") continue;
+    if (part === "..") {
+      current = path.dirname(current);
+      continue;
+    }
+    const next = path.join(current, part);
+    const stat = lstatOrNull(next);
+    if (!stat) return false;
+    if (stat.uid !== 0 && stat.uid !== uid) return false;
+    if (stat.isSymbolicLink()) {
+      if (++hops > 40) return false;
+      const link = readlinkSync(next);
+      if (link.length === 0) return false;
+      // Push the link text as written. Normalizing it first would resolve `..`
+      // lexically, before the component before it is known to be a link, which
+      // is not where the kernel's `..` lands.
+      if (path.isAbsolute(link)) current = path.sep;
+      pending.unshift(...link.split(path.sep).filter((part) => part.length > 0));
+      continue;
+    }
+    if (!stat.isDirectory()) return false;
+    if ((stat.mode & 0o022) !== 0 && (stat.mode & 0o1000) === 0) return false;
+    current = next;
+  }
+  return true;
+}
+
+export async function ensurePrivateDirectories(
+  root: string,
+  directory: string,
+  uid: number,
+  managedRoot = true,
+): Promise<boolean> {
+  for (const entry of managedRoot ? [root, directory] : [directory]) {
     try {
       await mkdir(entry, { mode: 0o700 });
     } catch (error) {
@@ -550,22 +653,46 @@ export async function ensurePrivateDirectories(root: string, directory: string, 
     }
     if (!safeDirectorySync(entry, uid)) return false;
   }
+  if (!managedRoot && !safeAncestrySync(directory, uid)) return false;
   return true;
+}
+
+/// Publish `bytes` at `target` through a private temporary file, removing the
+/// temporary on every failure. A failed `rename` (a directory at `target`, a
+/// refused write) otherwise leaves the file behind and each heartbeat adds
+/// another, because the next attempt picks a new random name.
+async function publishAtomically(temporary: string, target: string, bytes: Buffer): Promise<void> {
+  try {
+    const handle = await open(temporary, "wx", 0o600);
+    try {
+      await handle.write(bytes);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await rename(temporary, target);
+  } catch (error) {
+    try {
+      await unlink(temporary);
+    } catch {
+      // Nothing to remove, or it is gone; the original failure is the report.
+    }
+    throw error;
+  }
 }
 
 export async function writeSnapshot(directory: string, snapshot: Snapshot): Promise<void> {
   const target = path.join(directory, SNAPSHOT_NAME);
   // Unique per call: a heartbeat and an event can publish at the same time.
-  const temporary = path.join(directory, `.${SNAPSHOT_NAME}.${process.pid}.${tempSequence++}.tmp`);
-  const bytes = Buffer.from(`${JSON.stringify(snapshot)}\n`, "utf8");
-  const handle = await open(temporary, "w", 0o600);
-  try {
-    await handle.write(bytes);
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  await rename(temporary, target);
+  const temporary = temporaryName(directory, SNAPSHOT_NAME);
+  await publishAtomically(temporary, target, Buffer.from(`${JSON.stringify(snapshot)}\n`, "utf8"));
+}
+
+/// The host stores this as the conversation to resume, so the id it names must
+/// be the root conversation, not a subagent's.
+export async function writeSessionId(directory: string, leaf: string, sessionId: string): Promise<void> {
+  const temporary = temporaryName(directory, leaf);
+  await publishAtomically(temporary, path.join(directory, leaf), Buffer.from(sessionId, "utf8"));
 }
 
 /// Read the report this instance published, for the TUI part that answers
@@ -643,6 +770,8 @@ export type BridgeOptions = {
   pid?: number;
   heartbeatMs?: number;
   pollMs?: number;
+  /// Launch-scoped sidecar leaf; defaults to the launch's `AOE_SESSION_SOURCE`.
+  sessionIdLeaf?: string;
   log?: (message: string) => void;
 };
 
@@ -662,6 +791,7 @@ export function createBridge(options: BridgeOptions): Bridge {
   const supported = options.supported ?? isSupportedVersion(options.providerVersion);
   const replies = options.replies ?? supported;
   const tracker = createTracker();
+  const leaf = options.sessionIdLeaf ?? sessionIdLeaf(process.env[SESSION_SOURCE_ENV]);
   let rootSessionID: string | undefined;
   let status: Status | undefined;
   let prompt: Prompt | null = null;
@@ -698,6 +828,7 @@ export function createBridge(options: BridgeOptions): Bridge {
     if (serialized === written && now - lastWrite < (options.heartbeatMs ?? HEARTBEAT_MS)) return;
     try {
       await writeSnapshot(options.directory, snapshot);
+      await writeSessionId(options.directory, leaf, snapshot.provider_session_id);
       written = serialized;
       lastWrite = now;
     } catch (error) {
@@ -857,8 +988,8 @@ async function v1(input: Record<string, any>): Promise<Wiring | undefined> {
     );
   }
   const uid = process.getuid?.() ?? 0;
-  const hookDirectory = integrationDirectory(uid, instanceId);
-  if (!(await ensurePrivateDirectories(path.dirname(hookDirectory), hookDirectory, uid))) {
+  const { root, dir: hookDirectory, managed } = integrationPaths(process.env, uid, instanceId);
+  if (!(await ensurePrivateDirectories(root, hookDirectory, uid, managed))) {
     log(`could not secure ${hookDirectory}; leaving status to pane detection`);
     return undefined;
   }
@@ -912,8 +1043,8 @@ async function v2(ctx: Record<string, any>): Promise<Wiring | undefined> {
     );
   }
   const uid = process.getuid?.() ?? 0;
-  const hookDirectory = integrationDirectory(uid, instanceId);
-  if (!(await ensurePrivateDirectories(path.dirname(hookDirectory), hookDirectory, uid))) {
+  const { root, dir: hookDirectory, managed } = integrationPaths(process.env, uid, instanceId);
+  if (!(await ensurePrivateDirectories(root, hookDirectory, uid, managed))) {
     log(`could not secure ${hookDirectory}; leaving status to pane detection`);
     return undefined;
   }

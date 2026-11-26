@@ -129,6 +129,17 @@ Snapshots carry the live writer PID, a revision that changes only when the
 prompt changes, and `F12` as the only wake key. The extension rewrites the
 snapshot every 5 seconds so AoE's 15-second freshness window keeps holding.
 
+Beside the snapshot the extension writes the root conversation id as
+`session_id.<launch id>`, named after the `AOE_SESSION_SOURCE` the launch
+exports, or plain `session_id` when the launch names no source. That is the
+identity AoE stores for a resume; a subagent's id never replaces the root's.
+A sandboxed launch has only this directory mounted and names it in
+`AOE_INTEGRATION_DIR`, so the extension writes where the host reads without
+deriving a path from a uid it does not have on the host. The current release
+declares status only, so AoE still preassigns OpenCode's id; the sidecar is
+what a later manifest declares with `capture.backend = "extension_sidecar"`
+once OpenCode's launch contract moves into the manifest.
+
 In AoE's session list, select the OpenCode session and press `a` to open the
 approval or question dialog. AoE validates the reply against the current
 snapshot, writes it to `integration-agent-of-empires.opencode.reply.json`, and
