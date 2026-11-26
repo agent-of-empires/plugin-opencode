@@ -624,11 +624,12 @@ function safeAncestrySync(directory: string, uid: number): boolean {
     if (stat.isSymbolicLink()) {
       if (++hops > 40) return false;
       const link = readlinkSync(next);
-      const target = path.isAbsolute(link) ? link : path.resolve(current, link);
-      // An absolute target restarts from the root, an absolute component of one
-      // is not joined onto the link's own parent.
-      current = path.sep;
-      pending.unshift(...target.split(path.sep).filter((part) => part.length > 0));
+      if (link.length === 0) return false;
+      // Push the link text as written. Normalizing it first would resolve `..`
+      // lexically, before the component before it is known to be a link, which
+      // is not where the kernel's `..` lands.
+      if (path.isAbsolute(link)) current = path.sep;
+      pending.unshift(...link.split(path.sep).filter((part) => part.length > 0));
       continue;
     }
     if (!stat.isDirectory()) return false;

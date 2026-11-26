@@ -344,7 +344,8 @@ test("a configured directory follows a trusted alias but not an untrusted one", 
     const real = path.join(root, "real");
     mkdirSync(real, { mode: 0o755 });
     const alias = path.join(root, "alias");
-    symlinkSync(real, alias);
+    // Relative, the way a link under a shared directory usually is.
+    symlinkSync("real", alias);
     // This uid owns the alias and nobody else can replace it, which is how a
     // configured directory under /tmp on macOS works, since /tmp is a symlink.
     expect(await ensurePrivateDirectories(alias, path.join(alias, INSTANCE), UID, false)).toBe(true);
