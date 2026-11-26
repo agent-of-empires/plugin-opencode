@@ -348,6 +348,11 @@ test("a configured directory follows a trusted alias but not an untrusted one", 
     // This uid owns the alias and nobody else can replace it, which is how a
     // configured directory under /tmp on macOS works, since /tmp is a symlink.
     expect(await ensurePrivateDirectories(alias, path.join(alias, INSTANCE), UID, false)).toBe(true);
+    // A link inside the target of another link is followed and checked too, so
+    // the hop count is not a way around the rules.
+    const outer = path.join(root, "outer");
+    symlinkSync(alias, outer);
+    expect(await ensurePrivateDirectories(outer, path.join(outer, INSTANCE), UID, false)).toBe(true);
     // A trusted alias is not enough if it leads into a directory another user
     // can write to, so the resolved ancestors are checked as well.
     const open = path.join(root, "open");

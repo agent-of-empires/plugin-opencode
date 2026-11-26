@@ -12,7 +12,7 @@
 
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, realpathSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readlinkSync } from "node:fs";
 import type { Stats } from "node:fs";
 import { mkdir, open, rename, unlink } from "node:fs/promises";
 import path from "node:path";
@@ -595,50 +595,47 @@ function lstatOrNull(target: string): Stats | undefined {
   }
 }
 
-function safeParentSync(directory: string, uid: number): boolean {
-  const stat = lstatOrNull(directory);
-  if (!stat || !stat.isDirectory() || (stat.uid !== 0 && stat.uid !== uid)) return false;
-  return (stat.mode & 0o022) === 0 || (stat.mode & 0o1000) !== 0;
-}
-
 /// One safe parent does not help if a directory above it is replaceable: with
 /// `/srv/shared` open at 0777, another user can rename a provider-owned `ns`
-/// out of the way and put their own tree in its place. Every ancestor of the
-/// configured leaf is checked, so the path resolved here is the path written
-/// later.
+/// out of the way and put their own tree in its place. `realpath` is no better
+/// here, because it follows a link another user owns and reports only the
+/// destination it happens to reach now.
 ///
-/// The lexical chain is checked as written, because `realpath` alone would
-/// follow an alias another user owns: `/tmp/alias/session` would validate the
-/// destination and miss that `alias` can be repointed. `/tmp` itself is a
-/// root-owned symlink on macOS, so a trusted symlink is allowed.
+/// Walk the path one component at a time instead, following links explicitly and
+/// checking each hop the same way: a directory another user can write to lets
+/// them swap what comes next, and a link they own lets them repoint it. This is
+/// how `/tmp` stays usable, as it is a root-owned link on macOS and a sticky
+/// root-owned directory elsewhere.
 function safeAncestrySync(directory: string, uid: number): boolean {
-  let current = path.dirname(directory);
-  for (;;) {
-    const stat = lstatOrNull(current);
+  const pending = path.dirname(directory).split(path.sep).filter((part) => part.length > 0);
+  let current = path.sep;
+  let hops = 0;
+  while (pending.length > 0) {
+    const part = pending.shift()!;
+    if (part === ".") continue;
+    if (part === "..") {
+      current = path.dirname(current);
+      continue;
+    }
+    const next = path.join(current, part);
+    const stat = lstatOrNull(next);
     if (!stat) return false;
     if (stat.uid !== 0 && stat.uid !== uid) return false;
-    if (!stat.isSymbolicLink()) {
-      if (!stat.isDirectory()) return false;
-      if ((stat.mode & 0o022) !== 0 && (stat.mode & 0o1000) === 0) return false;
+    if (stat.isSymbolicLink()) {
+      if (++hops > 40) return false;
+      const link = readlinkSync(next);
+      const target = path.isAbsolute(link) ? link : path.resolve(current, link);
+      // An absolute target restarts from the root, an absolute component of one
+      // is not joined onto the link's own parent.
+      current = path.sep;
+      pending.unshift(...target.split(path.sep).filter((part) => part.length > 0));
+      continue;
     }
-    const parent = path.dirname(current);
-    if (parent === current) break;
-    current = parent;
+    if (!stat.isDirectory()) return false;
+    if ((stat.mode & 0o022) !== 0 && (stat.mode & 0o1000) === 0) return false;
+    current = next;
   }
-  // Physical ancestors of the destination, in case a trusted symlink leads to a
-  // directory another user can write to.
-  let physical: string;
-  try {
-    physical = path.dirname(realpathSync(directory));
-  } catch {
-    return false;
-  }
-  for (;;) {
-    if (!safeParentSync(physical, uid)) return false;
-    const parent = path.dirname(physical);
-    if (parent === physical) return true;
-    physical = parent;
-  }
+  return true;
 }
 
 export async function ensurePrivateDirectories(
