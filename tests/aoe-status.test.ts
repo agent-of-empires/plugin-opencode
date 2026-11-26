@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -23,6 +23,7 @@ import {
   satisfies,
   sessionIdLeaf,
   validateReply,
+  writeSessionId,
   writeSnapshot,
 } from "../opencode-extension/index.ts";
 
@@ -321,8 +322,34 @@ test("a configured directory needs a parent others cannot write, but not a priva
     // configured directory under /tmp stays usable.
     chmodSync(parent, 0o1777);
     expect(await ensurePrivateDirectories(parent, path.join(parent, "sticky"), UID, false)).toBe(true);
+
+    // A writable ancestor is just as good a way to swap the leaf, so the whole
+    // chain is checked, not only the immediate parent.
+    chmodSync(parent, 0o755);
+    const open = path.join(parent, "open");
+    mkdirSync(open);
+    chmodSync(open, 0o777);
+    const nested = path.join(open, "ns", INSTANCE);
+    mkdirSync(path.join(open, "ns"));
+    chmodSync(path.join(open, "ns"), 0o755);
+    expect(await ensurePrivateDirectories(path.join(open, "ns"), nested, UID, false)).toBe(false);
   } finally {
     rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test("a failed publication leaves no temporary file behind", async () => {
+  const root = privateDirectory();
+  try {
+    const directory = path.join(root, INSTANCE);
+    await ensurePrivateDirectories(root, directory, UID);
+    // A directory at the target makes `rename` fail after the temporary file is
+    // written and closed.
+    mkdirSync(path.join(directory, SESSION_ID_NAME));
+    await expect(writeSessionId(directory, SESSION_ID_NAME, "ses_root")).rejects.toThrow();
+    expect(readdirSync(directory)).toEqual([SESSION_ID_NAME]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

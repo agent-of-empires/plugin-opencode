@@ -12,7 +12,7 @@
 
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, realpathSync } from "node:fs";
 import { mkdir, open, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 
@@ -583,13 +583,38 @@ function safeDirectorySync(directory: string, uid: number): boolean {
 /// writable directory without the sticky bit lets them swap the private leaf
 /// for one of their own after it is validated. `/tmp`, owned by root at 1777,
 /// passes on the sticky bit, which is why a configured directory under it stays
-/// usable.
-function safeParentSync(directory: string): boolean {
+/// usable. The sticky bit only counts under an owner this process trusts,
+/// because a sticky directory's owner is exempt from it and could rename the
+/// leaf.
+function safeParentSync(directory: string, uid: number): boolean {
   try {
     const stat = lstatSync(directory);
-    return stat.isDirectory() && ((stat.mode & 0o022) === 0 || (stat.mode & 0o1000) !== 0);
+    if (!stat.isDirectory() || (stat.uid !== 0 && stat.uid !== uid)) return false;
+    return (stat.mode & 0o022) === 0 || (stat.mode & 0o1000) !== 0;
   } catch {
     return false;
+  }
+}
+
+/// One safe parent does not help if a directory above it is replaceable: with
+/// `/srv/shared` open at 0777, another user can rename a provider-owned `ns`
+// out of the way and put their own tree in its place. Every ancestor of the
+/// configured leaf is checked, so the path resolved here is the path written
+/// later.
+function safeAncestrySync(directory: string, uid: number): boolean {
+  let current: string;
+  try {
+    // Physical ancestors: `/var` is a symlink on macOS, and a lexical walk would
+    // refuse it while missing the directory it really resolves through.
+    current = path.dirname(realpathSync(directory));
+  } catch {
+    return false;
+  }
+  for (;;) {
+    if (!safeParentSync(current, uid)) return false;
+    const parent = path.dirname(current);
+    if (parent === current) return true;
+    current = parent;
   }
 }
 
@@ -607,37 +632,46 @@ export async function ensurePrivateDirectories(
     }
     if (!safeDirectorySync(entry, uid)) return false;
   }
-  if (!managedRoot && !safeParentSync(path.dirname(directory))) return false;
+  if (!managedRoot && !safeAncestrySync(directory, uid)) return false;
   return true;
+}
+
+/// Publish `bytes` at `target` through a private temporary file, removing the
+/// temporary on every failure. A failed `rename` (a directory at `target`, a
+/// refused write) otherwise leaves the file behind and each heartbeat adds
+/// another, because the next attempt picks a new random name.
+async function publishAtomically(temporary: string, target: string, bytes: Buffer): Promise<void> {
+  try {
+    const handle = await open(temporary, "wx", 0o600);
+    try {
+      await handle.write(bytes);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await rename(temporary, target);
+  } catch (error) {
+    try {
+      await unlink(temporary);
+    } catch {
+      // Nothing to remove, or it is gone; the original failure is the report.
+    }
+    throw error;
+  }
 }
 
 export async function writeSnapshot(directory: string, snapshot: Snapshot): Promise<void> {
   const target = path.join(directory, SNAPSHOT_NAME);
   // Unique per call: a heartbeat and an event can publish at the same time.
   const temporary = temporaryName(directory, SNAPSHOT_NAME);
-  const bytes = Buffer.from(`${JSON.stringify(snapshot)}\n`, "utf8");
-  const handle = await open(temporary, "wx", 0o600);
-  try {
-    await handle.write(bytes);
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  await rename(temporary, target);
+  await publishAtomically(temporary, target, Buffer.from(`${JSON.stringify(snapshot)}\n`, "utf8"));
 }
 
 /// The host stores this as the conversation to resume, so the id it names must
 /// be the root conversation, not a subagent's.
 export async function writeSessionId(directory: string, leaf: string, sessionId: string): Promise<void> {
   const temporary = temporaryName(directory, leaf);
-  const handle = await open(temporary, "wx", 0o600);
-  try {
-    await handle.write(Buffer.from(sessionId, "utf8"));
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  await rename(temporary, path.join(directory, leaf));
+  await publishAtomically(temporary, path.join(directory, leaf), Buffer.from(sessionId, "utf8"));
 }
 
 /// Read the report this instance published, for the TUI part that answers
