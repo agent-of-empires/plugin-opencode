@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, symlinkSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -335,6 +335,31 @@ test("a configured directory needs a parent others cannot write, but not a priva
     expect(await ensurePrivateDirectories(path.join(open, "ns"), nested, UID, false)).toBe(false);
   } finally {
     rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test("a configured directory follows a trusted alias but not an untrusted one", async () => {
+  const root = privateDirectory();
+  try {
+    const real = path.join(root, "real");
+    mkdirSync(real, { mode: 0o755 });
+    const alias = path.join(root, "alias");
+    symlinkSync(real, alias);
+    // This uid owns the alias and nobody else can replace it, which is how a
+    // configured directory under /tmp on macOS works, since /tmp is a symlink.
+    expect(await ensurePrivateDirectories(alias, path.join(alias, INSTANCE), UID, false)).toBe(true);
+    // A trusted alias is not enough if it leads into a directory another user
+    // can write to, so the resolved ancestors are checked as well.
+    const open = path.join(root, "open");
+    mkdirSync(open);
+    chmodSync(open, 0o777);
+    const deep = path.join(open, "deep");
+    mkdirSync(deep);
+    const unsafeAlias = path.join(root, "unsafe-alias");
+    symlinkSync(deep, unsafeAlias);
+    expect(await ensurePrivateDirectories(unsafeAlias, path.join(unsafeAlias, INSTANCE), UID, false)).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

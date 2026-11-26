@@ -13,6 +13,7 @@
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, realpathSync } from "node:fs";
+import type { Stats } from "node:fs";
 import { mkdir, open, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 
@@ -586,35 +587,57 @@ function safeDirectorySync(directory: string, uid: number): boolean {
 /// usable. The sticky bit only counts under an owner this process trusts,
 /// because a sticky directory's owner is exempt from it and could rename the
 /// leaf.
-function safeParentSync(directory: string, uid: number): boolean {
+function lstatOrNull(target: string): Stats | undefined {
   try {
-    const stat = lstatSync(directory);
-    if (!stat.isDirectory() || (stat.uid !== 0 && stat.uid !== uid)) return false;
-    return (stat.mode & 0o022) === 0 || (stat.mode & 0o1000) !== 0;
+    return lstatSync(target);
   } catch {
-    return false;
+    return undefined;
   }
+}
+
+function safeParentSync(directory: string, uid: number): boolean {
+  const stat = lstatOrNull(directory);
+  if (!stat || !stat.isDirectory() || (stat.uid !== 0 && stat.uid !== uid)) return false;
+  return (stat.mode & 0o022) === 0 || (stat.mode & 0o1000) !== 0;
 }
 
 /// One safe parent does not help if a directory above it is replaceable: with
 /// `/srv/shared` open at 0777, another user can rename a provider-owned `ns`
-// out of the way and put their own tree in its place. Every ancestor of the
+/// out of the way and put their own tree in its place. Every ancestor of the
 /// configured leaf is checked, so the path resolved here is the path written
 /// later.
+///
+/// The lexical chain is checked as written, because `realpath` alone would
+/// follow an alias another user owns: `/tmp/alias/session` would validate the
+/// destination and miss that `alias` can be repointed. `/tmp` itself is a
+/// root-owned symlink on macOS, so a trusted symlink is allowed.
 function safeAncestrySync(directory: string, uid: number): boolean {
-  let current: string;
+  let current = path.dirname(directory);
+  for (;;) {
+    const stat = lstatOrNull(current);
+    if (!stat) return false;
+    if (stat.uid !== 0 && stat.uid !== uid) return false;
+    if (!stat.isSymbolicLink()) {
+      if (!stat.isDirectory()) return false;
+      if ((stat.mode & 0o022) !== 0 && (stat.mode & 0o1000) === 0) return false;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  // Physical ancestors of the destination, in case a trusted symlink leads to a
+  // directory another user can write to.
+  let physical: string;
   try {
-    // Physical ancestors: `/var` is a symlink on macOS, and a lexical walk would
-    // refuse it while missing the directory it really resolves through.
-    current = path.dirname(realpathSync(directory));
+    physical = path.dirname(realpathSync(directory));
   } catch {
     return false;
   }
   for (;;) {
-    if (!safeParentSync(current, uid)) return false;
-    const parent = path.dirname(current);
-    if (parent === current) return true;
-    current = parent;
+    if (!safeParentSync(physical, uid)) return false;
+    const parent = path.dirname(physical);
+    if (parent === physical) return true;
+    physical = parent;
   }
 }
 
