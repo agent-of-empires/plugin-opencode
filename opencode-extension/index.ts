@@ -11,6 +11,7 @@
 //   * OpenCode 2.x loads `setup(ctx)` and subscribes to the event bus.
 
 import { execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
 import { mkdir, open, rename, unlink } from "node:fs/promises";
 import path from "node:path";
@@ -30,7 +31,13 @@ export const SESSION_SOURCE_ENV = "AOE_SESSION_SOURCE";
 export const SESSION_ID_NAME = "session_id";
 const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
-let tempSequence = 0;
+/// A publish target that cannot be guessed or planted before it is written. The
+/// name is random rather than a pid/counter, and the write opens it with
+/// O_EXCL, so a file already at that path is an error instead of a file this
+/// report is written into.
+function temporaryName(directory: string, leaf: string): string {
+  return path.join(directory, `.${leaf}.${randomBytes(8).toString("hex")}.tmp`);
+}
 
 /// Declared in `aoe-plugin.toml` as well. The host decides compatibility from
 /// the published version; this copy keeps an unsupported runtime from driving
@@ -571,6 +578,21 @@ function safeDirectorySync(directory: string, uid: number): boolean {
   }
 }
 
+/// Whether another user cannot add or rename entries in `directory`. A parent
+/// that is not ours to own still has to be closed to others: a group or world
+/// writable directory without the sticky bit lets them swap the private leaf
+/// for one of their own after it is validated. `/tmp`, owned by root at 1777,
+/// passes on the sticky bit, which is why a configured directory under it stays
+/// usable.
+function safeParentSync(directory: string): boolean {
+  try {
+    const stat = lstatSync(directory);
+    return stat.isDirectory() && ((stat.mode & 0o022) === 0 || (stat.mode & 0o1000) !== 0);
+  } catch {
+    return false;
+  }
+}
+
 export async function ensurePrivateDirectories(
   root: string,
   directory: string,
@@ -585,15 +607,16 @@ export async function ensurePrivateDirectories(
     }
     if (!safeDirectorySync(entry, uid)) return false;
   }
+  if (!managedRoot && !safeParentSync(path.dirname(directory))) return false;
   return true;
 }
 
 export async function writeSnapshot(directory: string, snapshot: Snapshot): Promise<void> {
   const target = path.join(directory, SNAPSHOT_NAME);
   // Unique per call: a heartbeat and an event can publish at the same time.
-  const temporary = path.join(directory, `.${SNAPSHOT_NAME}.${process.pid}.${tempSequence++}.tmp`);
+  const temporary = temporaryName(directory, SNAPSHOT_NAME);
   const bytes = Buffer.from(`${JSON.stringify(snapshot)}\n`, "utf8");
-  const handle = await open(temporary, "w", 0o600);
+  const handle = await open(temporary, "wx", 0o600);
   try {
     await handle.write(bytes);
     await handle.sync();
@@ -606,8 +629,8 @@ export async function writeSnapshot(directory: string, snapshot: Snapshot): Prom
 /// The host stores this as the conversation to resume, so the id it names must
 /// be the root conversation, not a subagent's.
 export async function writeSessionId(directory: string, leaf: string, sessionId: string): Promise<void> {
-  const temporary = path.join(directory, `.${leaf}.${process.pid}.${tempSequence++}.tmp`);
-  const handle = await open(temporary, "w", 0o600);
+  const temporary = temporaryName(directory, leaf);
+  const handle = await open(temporary, "wx", 0o600);
   try {
     await handle.write(Buffer.from(sessionId, "utf8"));
     await handle.sync();

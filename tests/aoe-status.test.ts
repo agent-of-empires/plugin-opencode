@@ -300,15 +300,27 @@ test("reports round-trip through a private directory and replies are read back",
   }
 });
 
-test("a configured directory needs no private parent, unlike the managed namespace", async () => {
+test("a configured directory needs a parent others cannot write, but not a private one", async () => {
   const parent = privateDirectory();
   try {
+    // Root-owned or ordinary 0755 parents are fine: nobody else can rename the
+    // leaf, so only the leaf has to be private and provider-owned.
     chmodSync(parent, 0o755);
     const configured = path.join(parent, INSTANCE);
     expect(await ensurePrivateDirectories(parent, configured, UID, false)).toBe(true);
     expect(statSync(configured).mode & 0o777).toBe(0o700);
     // The namespace this extension creates still requires both levels.
     expect(await ensurePrivateDirectories(parent, path.join(parent, "managed"), UID)).toBe(false);
+
+    // A parent another user can add or rename entries in lets them swap the
+    // private leaf after this check, so it is refused.
+    chmodSync(parent, 0o777);
+    expect(await ensurePrivateDirectories(parent, path.join(parent, "swappable"), UID, false)).toBe(false);
+
+    // The sticky bit is what makes a shared directory safe, which is how a
+    // configured directory under /tmp stays usable.
+    chmodSync(parent, 0o1777);
+    expect(await ensurePrivateDirectories(parent, path.join(parent, "sticky"), UID, false)).toBe(true);
   } finally {
     rmSync(parent, { recursive: true, force: true });
   }
